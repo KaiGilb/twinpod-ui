@@ -1,6 +1,6 @@
 {
   "name": "@kaigilb/twinpod-ui",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Reusable Vue 3 composables and components for TwinPod applications",
   "type": "module",
   "main": "src/index.js",

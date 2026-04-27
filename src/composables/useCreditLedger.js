@@ -51,6 +51,15 @@
 import { ref } from 'vue'
 import { ur } from '@kaigilb/twinpod-client'
 
+// Spec: Evo9.WebIDFreeCredit — whitelisted WebIDs receive a one-time 100K credit grant
+// on first login (no existing pod ledger). They appear as normal credit holders to the
+// gate, meter, and telemetry — usage is tracked, not bypassed.
+const FREE_CREDIT_WEBIDS = [
+  'https://kai.gilb.com/i',
+  'https://tommy.gilb.com/i'
+]
+const FREE_CREDIT_AMOUNT = 100000
+
 /**
  * Ensure a Solid LDP container exists at containerUrl.
  * Issues a HEAD to check; if absent (404), creates it via PUT with Link type header.
@@ -106,7 +115,7 @@ export function useCreditLedger() {
    *
    * Spec: 3P.F.ContributionFlow — credits displayed after purchase round-trip completes
    */
-  async function loadCredits(podRoot, bearerToken, authenticatedFetch) {
+  async function loadCredits(podRoot, bearerToken, authenticatedFetch, webId) {
     if (!podRoot) return
 
     _podRoot = podRoot
@@ -134,12 +143,78 @@ export function useCreditLedger() {
         // ledgers treated as false/null so existing users are not affected.
         trialUsed.value = data.trialUsed ?? false
         trialStartedAt.value = data.trialStartedAt ?? null
+
+        // Spec: Evo9.WebIDFreeCredit (recovery branch) — if a whitelisted WebID
+        // has an existing ledger with balance=0 AND no prior `grant` entry (e.g. a
+        // stale trial-start write created the ledger before the grant could fire),
+        // apply the 100K grant idempotently. Guarded by the "no prior grant" check
+        // so it can never re-grant.
+        const hasPriorGrant = (ledger.value || []).some(e => e?.type === 'grant')
+        if (webId && FREE_CREDIT_WEBIDS.includes(webId) && (balance.value === 0) && !hasPriorGrant) {
+          const now = new Date().toISOString()
+          const grantedLedger = {
+            ...data,
+            balance: FREE_CREDIT_AMOUNT,
+            ledger: [...(data.ledger || []), { type: 'grant', credits: FREE_CREDIT_AMOUNT, reason: 'whitelist', ts: now }],
+            updatedAt: now
+          }
+          balance.value = FREE_CREDIT_AMOUNT
+          ledger.value = grantedLedger.ledger
+          try {
+            await ensureContainer(podRoot + '/apps/', fetcher)
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher)
+            const putRes = await fetcher(ledgerUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(grantedLedger, null, 2)
+            })
+            if (!putRes.ok) {
+              console.warn('[useCreditLedger] Evo9 recovery grant PUT failed (non-fatal):', putRes.status)
+            }
+          } catch (e) {
+            console.warn('[useCreditLedger] Evo9 recovery grant write error (non-fatal):', e.message)
+          }
+        }
       } else if (response.status === 404) {
-        // First-time user — no ledger yet; use defaults
-        balance.value = 0
-        ledger.value = []
-        trialUsed.value = false
-        trialStartedAt.value = null
+        // First-time user — no ledger yet
+        // Spec: Evo9.WebIDFreeCredit — whitelisted WebIDs get a 100K grant on first login.
+        // Non-whitelisted users stay at 0 (existing trial flow applies).
+        if (webId && FREE_CREDIT_WEBIDS.includes(webId)) {
+          balance.value = FREE_CREDIT_AMOUNT
+          const now = new Date().toISOString()
+          const initialLedger = {
+            balance: FREE_CREDIT_AMOUNT,
+            ledger: [{ type: 'grant', credits: FREE_CREDIT_AMOUNT, reason: 'whitelist', ts: now }],
+            processedEvents: [],
+            updatedAt: now,
+            trialUsed: false,
+            trialStartedAt: null
+          }
+          ledger.value = initialLedger.ledger
+          trialUsed.value = false
+          trialStartedAt.value = null
+
+          // Write the initial ledger to the pod so subsequent logins load it normally
+          try {
+            await ensureContainer(podRoot + '/apps/', fetcher)
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher)
+            const putRes = await fetcher(ledgerUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(initialLedger, null, 2)
+            })
+            if (!putRes.ok) {
+              console.warn('[useCreditLedger] Evo9 grant PUT failed (non-fatal):', putRes.status)
+            }
+          } catch (e) {
+            console.warn('[useCreditLedger] Evo9 grant write error (non-fatal):', e.message)
+          }
+        } else {
+          balance.value = 0
+          ledger.value = []
+          trialUsed.value = false
+          trialStartedAt.value = null
+        }
       } else {
         console.error('[useCreditLedger] Unexpected status loading ledger:', response.status)
         error.value = `Could not load credit balance (${response.status})`
@@ -469,8 +544,13 @@ export function useCreditLedger() {
         console.warn('[useCreditLedger] decrementCredit GET failed (using in-memory state):', e)
       }
 
-      // Apply debit to the freshly-read balance (guards against concurrent updates)
-      const newBalance = Math.max(0, (existing.balance ?? 0) - amount)
+      // Apply debit to the freshly-read balance (guards against concurrent updates).
+      // Use max(in-memory pre-decrement, pod) as the starting point: if the pod read
+      // is stale (e.g. our recovery grant PUT hasn't landed yet), trust the in-memory
+      // value; if another tab credited the user, use the higher pod value.
+      const inMemoryPreDecrement = balance.value + amount  // optimistic was applied earlier
+      const startBalance = Math.max(inMemoryPreDecrement, existing.balance ?? 0)
+      const newBalance = Math.max(0, startBalance - amount)
 
       // Sync reactive state to the server-confirmed balance
       balance.value = newBalance

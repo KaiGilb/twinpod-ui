@@ -2,9 +2,13 @@
 <!--
   LoginView.vue
 
-  Login gate for The Brain.
-  Shows the app title and a single "Connect to TwinPod" button that initiates the
+  Shared login gate for TwinPod apps.
+  Shows the app title/subtitle (configurable via props), a background image,
+  and a server selector (twinpod.eu / twinpod.us / other) that initiates the
   Solid OIDC redirect flow. Auth state is injected via provide/inject from App.vue.
+
+  Props default to "Tom Gilb / Twin Consultant" so The Brain continues to work
+  without any code changes after this upgrade.
 
   Spec: F.TwinPodLoginScreen — unauthenticated users see this view only.
         V.KaiIdentityConfidence — login must initiate OIDC redirect within 500ms.
@@ -14,14 +18,37 @@
 
 <script setup>
 /**
- * Login page for The Brain.
- * Shows a server selector (twinpod.eu / twinpod.us) and a "Connect" button
- * that initiates the Solid OIDC redirect flow against the chosen server.
+ * Shared login page component for TwinPod apps.
+ * Renders a full-screen login gate with configurable app identity and background image.
+ * Delegates auth to the provided login() injected from App.vue.
  *
- * @see Spec: /Users/kaigilb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Kai-Zen-Vault/5 - Project/The Brain/01Planning/TheBrain-Specs/
+ * @prop {string} [appTitle='Tom Gilb'] - App name displayed as the main heading.
+ * @prop {string} [appSubtitle='Twin Consultant'] - Subtitle displayed below the app title.
+ * @prop {string} [backgroundImage='/login-bg.jpg'] - CSS url() value for the hero background.
+ *
+ * @see Spec: /Users/kaigilb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Kai-Zen-Vault/5 - Project/NoteWorld/01Planning/NoteWorld-Specs/3P.F.TwinPodLoginScreen.md
  */
 
-import { ref, inject } from 'vue'
+import { ref, inject, computed } from 'vue'
+
+// Per-app identity — defaults preserve The Brain's existing text without code changes.
+const props = defineProps({
+  /** Main heading: the name of the app using this login screen. */
+  appTitle: { type: String, default: 'Tom Gilb' },
+  /** Sub-heading shown below the app title. */
+  appSubtitle: { type: String, default: 'Twin Consultant' },
+  /**
+   * Hero background image path passed as a CSS url() string.
+   * Each app places its own image in its public/ folder and passes the path here
+   * so the shared component is not tied to any single app's public asset layout.
+   */
+  backgroundImage: { type: String, default: '/login-bg.jpg' }
+})
+
+// Bind background-image as an inline style so each app can supply its own asset.
+const rootStyle = computed(() => ({
+  backgroundImage: `url('${props.backgroundImage}')`
+}))
 
 // Auth state and actions are provided by App.vue root component.
 const { login, error, loading } = inject('auth')
@@ -54,11 +81,11 @@ function connect(url) {
 </script>
 
 <template>
-  <main class="login__root">
+  <main class="login__root" :style="rootStyle">
     <div class="login__card">
       <h1 class="login__title">
-        Tom Gilb
-        <span class="login__title-sub">Twin Consultant</span>
+        {{ props.appTitle }}
+        <span class="login__title-sub">{{ props.appSubtitle }}</span>
       </h1>
       <p class="login__subtitle">Connect your TwinPod to get started</p>
 
@@ -159,7 +186,7 @@ function connect(url) {
   padding: 2rem 1.5rem;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 
-  /* Background hero image */
+  /* Background hero image — set via backgroundImage prop; inline style overrides this placeholder. */
   background-image: url('/login-bg.jpg');
   background-size: cover;
   background-position: center center;
@@ -268,10 +295,12 @@ function connect(url) {
 }
 
 /* "other" toggle link */
+/* MOBILE_03: min-height + padding ensures 44×44px touch target */
 .login__other-toggle {
   background: none;
   border: none;
-  padding: 0;
+  padding: 0.75rem 1rem;
+  min-height: 44px;
   color: rgba(255, 255, 255, 0.4);
   font-size: 0.8125rem;
   cursor: pointer;
@@ -279,6 +308,8 @@ function connect(url) {
   text-underline-offset: 2px;
   transition: color 0.15s;
   align-self: center;
+  display: flex;
+  align-items: center;
 }
 
 .login__other-toggle:hover {
