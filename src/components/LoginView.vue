@@ -41,8 +41,10 @@ const props = defineProps({
    * Hero background image path passed as a CSS url() string.
    * Each app places its own image in its public/ folder and passes the path here
    * so the shared component is not tied to any single app's public asset layout.
+   * Default uses Vite's BASE_URL so apps deployed under a sub-path (e.g. /tomtwin/)
+   * resolve the asset correctly without needing to pass the prop.
    */
-  backgroundImage: { type: String, default: '/login-bg.jpg' }
+  backgroundImage: { type: String, default: `${import.meta.env.BASE_URL}login-bg.jpg` }
 })
 
 // Bind background-image as an inline style so each app can supply its own asset.
