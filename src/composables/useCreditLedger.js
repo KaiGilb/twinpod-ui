@@ -144,21 +144,22 @@ export function useCreditLedger() {
         trialUsed.value = data.trialUsed ?? false
         trialStartedAt.value = data.trialStartedAt ?? null
 
-        // Spec: Evo9.WebIDFreeCredit (recovery branch) — if a whitelisted WebID
-        // has an existing ledger with balance=0 AND no prior `grant` entry (e.g. a
-        // stale trial-start write created the ledger before the grant could fire),
-        // apply the 100K grant idempotently. Guarded by the "no prior grant" check
-        // so it can never re-grant.
+        // Spec: Evo9.WebIDFreeCredit (recovery / grant-on-top branch) — if a
+        // whitelisted WebID has an existing ledger AND no prior `grant` entry,
+        // apply the 100K grant idempotently. Adds 100K on top of whatever balance
+        // already exists (e.g. Tommy paid 500 → ends up with 100,500). Guarded by
+        // the "no prior grant" check so it can never re-grant.
         const hasPriorGrant = (ledger.value || []).some(e => e?.type === 'grant')
-        if (webId && FREE_CREDIT_WEBIDS.includes(webId) && (balance.value === 0) && !hasPriorGrant) {
+        if (webId && FREE_CREDIT_WEBIDS.includes(webId) && !hasPriorGrant) {
           const now = new Date().toISOString()
+          const newBalance = (balance.value || 0) + FREE_CREDIT_AMOUNT
           const grantedLedger = {
             ...data,
-            balance: FREE_CREDIT_AMOUNT,
+            balance: newBalance,
             ledger: [...(data.ledger || []), { type: 'grant', credits: FREE_CREDIT_AMOUNT, reason: 'whitelist', ts: now }],
             updatedAt: now
           }
-          balance.value = FREE_CREDIT_AMOUNT
+          balance.value = newBalance
           ledger.value = grantedLedger.ledger
           try {
             await ensureContainer(podRoot + '/apps/', fetcher)
