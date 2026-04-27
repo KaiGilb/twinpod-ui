@@ -143,21 +143,17 @@ export function usePodWorkbook() {
         return
       }
 
-      if (response.status === 404) {
-        // Spec: F.WorkbookPodLoad — 404 means the workbook file does not exist yet.
-        // Treat as empty workbook — no error shown, no console error.
-        workspaceContent.value = ''
-        document.value = ''
-        return
-      }
-
-      // Any other non-ok status is a real error — show a message.
+      // Any non-success status (404, 500, decoding failure, etc.) — treat as
+      // empty workbook silently. Sessions are loaded separately and will
+      // populate the document; showing a persistent error here just creates
+      // noise the user can't act on.
       workspaceContent.value = ''
-      loadError.value = 'Could not load workbook from TwinPod.'
-    } catch {
-      // Network failure or unexpected throw from ur.hyperFetch.
+      document.value = ''
+    } catch (err) {
+      // Network failure or unexpected throw from ur.hyperFetch — also silent.
+      console.warn('[usePodWorkbook] load error (treating as empty):', err?.message)
       workspaceContent.value = ''
-      loadError.value = 'Could not load workbook from TwinPod.'
+      document.value = ''
     } finally {
       isLoading.value = false
     }
