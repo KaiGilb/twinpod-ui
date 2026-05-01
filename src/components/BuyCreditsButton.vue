@@ -57,7 +57,18 @@ export default {
   },
 
   setup() {
-    const { startCheckout, loading: checkoutLoading, error } = useCreditLedger()
+    // useCreditLedger() here may resolve to a separate module instance from the one
+    // App.vue uses (Vite symlink dedup issue with file: linked packages). We use the
+    // composable for loading/error display, but prefer the startCheckout injected from
+    // App.vue — that instance had loadCredits() called and has _podRoot set correctly.
+    // checkoutLoading is a dedicated ref that's only true during an active startCheckout call.
+    // It is NOT loading (which tracks loadCredits/applyPendingCredits). Using loading here
+    // caused buttons to be disabled while loadCredits was in-flight at page load.
+    const { checkoutLoading, error, startCheckout: composableStartCheckout } = useCreditLedger()
+
+    // App.vue provides startCheckout from its own (correctly initialised) useCreditLedger
+    // instance. Injecting it here bypasses any dual-instance _podRoot problem.
+    const injectedStartCheckout = inject('startCheckout', null)
 
     // Bundle price IDs provided by App.vue — maps bundle key to Stripe priceId string.
     // If not provided (e.g. in tests), buttons show but clicking logs a warning.
@@ -65,6 +76,8 @@ export default {
 
     /**
      * Handle a bundle button click — look up the Stripe price ID and call startCheckout.
+     * Prefers the injected startCheckout (from App.vue's initialised instance).
+     * Falls back to the composable's startCheckout for standalone/test use.
      *
      * @param {string} bundleKey - 'starter' | 'standard' | 'power'
      */
@@ -74,7 +87,8 @@ export default {
         console.error('[BuyCreditsButton] No priceId for bundle:', bundleKey)
         return
       }
-      await startCheckout(priceId)
+      const checkout = injectedStartCheckout ?? composableStartCheckout
+      await checkout(priceId)
     }
 
     return {

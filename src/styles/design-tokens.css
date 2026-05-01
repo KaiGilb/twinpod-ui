@@ -1,0 +1,72 @@
+/* =============================================
+   Design Tokens — Kai-Initiated Projects (MASTER)
+   Source of truth: Reference_Code_design-tokens.md (vault)
+   This file is the shared master consumed by all Kai-initiated apps via
+   `import '@kaigilb/twinpod-ui/design-tokens.css'`. Do not add hex values
+   in any other file (per TOKEN_01).
+   ============================================= */
+
+:root {
+  /* Brand */
+  --color-primary:          #3698A2;
+  --color-primary-dark:     #1F6570; /* WCAG 2.1 AA compliant with white text — 6.66:1 */
+  --color-primary-light:    #DBEAEA;
+  --color-primary-lighter:  #E9F6F8;
+  --color-primary-lightest: #CEEBEF;
+
+  /* Surface (warm off-white family) */
+  --color-surface-base:     #F7F5F1;
+  --color-surface-card:     #FBFAF8;
+  --color-surface-input:    #FEFDFB;
+  --color-surface-white:    #FFFFFF;
+  --color-surface-disabled: #F5F5F5;
+
+  /* Text */
+  --color-text-primary:     #161514;
+  --color-text-secondary:   #596780;
+  --color-text-muted:       #808080;
+  --color-text-disabled:    #959190;
+  --color-text-inverse:     #FEFDFB;
+  --color-text-interactive: var(--color-primary);
+
+  /* Borders */
+  --color-border-default:   #CECECD;
+  --color-border-subtle:    #E6E6E6;
+  --color-border-minimal:   #F1F1F0;
+  --color-border-medium:    #B3B3B3;
+  --color-border-active:    var(--color-primary);
+
+  /* Navigation */
+  --color-nav-dark:         #1A2A44;
+  --color-nav-text:         #232F3E;
+  --color-icon-muted:       #959190;
+
+  /* Connection types */
+  --color-connection-pro-bg:          #DAE8FC;
+  --color-connection-pro-border:      #6C8EBF;
+  --color-connection-personal-bg:     #D5E8D4;
+  --color-connection-personal-border: #82B366;
+  --color-connection-mixed-bg:        #FFF2CC;
+  --color-connection-mixed-border:    #D6B656;
+  --color-connection-blocked-bg:      #F8CECC;
+  --color-connection-blocked-border:  #B85450;
+
+  /* Status / error */
+  --color-error-light:           #FFDADA;
+  --color-error-dark:            #8B0000;
+  --color-status-special-bg:     #FCF8FF;
+  --color-status-special-border: #D3A6E9;
+
+  /* Voice input states — used by The Brain; harmless inclusion in shared master.
+     Apps that don't use voice UI will simply not reference these tokens. */
+  --color-mic-listening-bg:        #F0FDF4;
+  --color-mic-listening-border:    #22C55E;
+  --color-mic-listening-text:      #16A34A;
+  --color-mic-listening-pulse:     rgba(34, 197, 94, 0.45);
+  --color-mic-speaking-bg:         #FEF2F2;
+  --color-mic-speaking-border:     #EF4444;
+  --color-mic-speaking-text:       #EF4444;
+  --color-mic-transcribing-bg:     #FFFBEB;
+  --color-mic-transcribing-border: #F59E0B;
+  --color-mic-transcribing-text:   #F59E0B;
+}

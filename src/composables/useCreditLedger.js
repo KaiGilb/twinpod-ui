@@ -6,9 +6,10 @@
  * Manages the user's credit ledger stored at {podRoot}/apps/TomTwin/thebrain-credits.json.
  *
  * Read path:
- *   loadCredits(podRoot, bearerToken) — GETs the ledger JSON from the pod.
- *   Returns { balance: 0, ledger: [], processedEvents: [], updatedAt: null,
- *             trialUsed: false, trialStartedAt: null } on 404.
+ *   loadCredits(podRoot, bearerToken, authenticatedFetch, webId) — GETs the ledger JSON
+ *   from the pod. Returns { balance: 0, ledger: [], processedEvents: [], updatedAt: null,
+ *   trialUsed: false, trialStartedAt: null } on 404 (unless webId is whitelisted —
+ *   whitelisted users get a 100K grant written to the pod on first login).
  *   Uses ur.hyperFetch for the authenticated request (window.solid.session bearer).
  *
  * Purchase path:
@@ -30,7 +31,7 @@
  *   ledger:         import('vue').Ref<array>,
  *   loading:        import('vue').Ref<boolean>,
  *   error:          import('vue').Ref<string|null>,
- *   loadCredits:    (podRoot: string, bearerToken: string) => Promise<void>,
+ *   loadCredits:    (podRoot: string, bearerToken: string, authenticatedFetch?: Function, webId?: string) => Promise<void>,
  *   startCheckout:  (priceId: string) => Promise<void>
  * }}
  *
@@ -46,17 +47,23 @@
  * Spec: 3P.F.ContributionFlow — startCheckout initiates the Stripe Checkout purchase flow
  *       3P.V.ContributionEventCompletionRate — loadCredits verifies completed purchases
  *       Evo3a.TrialSchemaAndGate — trialUsed and trialStartedAt fields tracked here
+ *       Evo9.WebIDFreeCredit — whitelisted WebIDs receive a 100K credit grant on first login
  */
 
 import { ref } from 'vue'
 import { ur } from '@kaigilb/twinpod-client'
+import { isRealTwinPodResource } from './util/twinpod-resource-exists.js'
 
 // Spec: Evo9.WebIDFreeCredit — whitelisted WebIDs receive a one-time 100K credit grant
 // on first login (no existing pod ledger). They appear as normal credit holders to the
 // gate, meter, and telemetry — usage is tracked, not bypassed.
+// Cycle 19 follow-up #5 (2026-04-28): added tst-heppa and tst-testertom to unblock
+// fresh-pod testing of the whitelist branch.
 const FREE_CREDIT_WEBIDS = [
   'https://kai.gilb.com/i',
-  'https://tommy.gilb.com/i'
+  'https://tommy.gilb.com/i',
+  'https://tst-heppa.demo.systemtwin.com/i',
+  'https://tst-testertom.demo.systemtwin.com/i'
 ]
 const FREE_CREDIT_AMOUNT = 100000
 
@@ -65,22 +72,38 @@ const FREE_CREDIT_AMOUNT = 100000
  * Issues a HEAD to check; if absent (404), creates it via PUT with Link type header.
  * No-op if already exists.
  *
+ * Cycle 19 follow-up #9 (2026-04-27): added optional { slug, label } options so
+ * containers created on TwinPod display with a human-readable name in the
+ * SystemTwin™ app tree. Without these, an empty-Turtle PUT lands as a generic
+ * BasicContainer that the SystemTwin™ app labels with a derived dotted-prefix
+ * name (e.g. `_TomTwin.apps_`). With Slug + rdfs:label the app shows the proper
+ * name (e.g. "TomTwin" / "The Brain (Tom Twin) — App Data"). See
+ * Reference_Code_TwinPod-DefaultContainers.md § Companion quirk.
+ *
  * @param {string} containerUrl - URL ending with /
  * @param {Function} authenticatedFetch - session.fetch from caller
+ * @param {Object} [opts]
+ * @param {string} [opts.slug] - Slug header (display name hint for SystemTwin™ tree)
+ * @param {string} [opts.label] - rdfs:label literal written into the container's Turtle body
  */
-async function ensureContainer(containerUrl, authenticatedFetch) {
+async function ensureContainer(containerUrl, authenticatedFetch, opts = {}) {
   try {
     const check = await authenticatedFetch(containerUrl, { method: 'HEAD' })
     if (check.ok || check.status === 200) return // already exists
     if (check.status !== 404) return // unexpected — don't attempt to create
     // Create the container
+    const headers = {
+      'Content-Type': 'text/turtle',
+      'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+    }
+    if (opts.slug) headers['Slug'] = opts.slug
+    const body = opts.label
+      ? `@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "${opts.label.replace(/"/g, '\\"')}" .`
+      : ''
     await authenticatedFetch(containerUrl, {
       method: 'PUT',
-      headers: {
-        'Content-Type': 'text/turtle',
-        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
-      },
-      body: ''
+      headers,
+      body
     })
   } catch (e) {
     console.warn('[useCreditLedger] ensureContainer failed for', containerUrl, e)
@@ -95,7 +118,10 @@ const balance = ref(0)
 const trialUsed = ref(false)
 const trialStartedAt = ref(null)
 const ledger = ref([])
-const loading = ref(false)
+const loading = ref(false)           // true during loadCredits / applyPendingCredits
+const checkoutLoading = ref(false)   // true during startCheckout only — separate so the
+                                     // BuyCreditsButton buttons are NOT disabled while
+                                     // loadCredits is in-flight (page-reload paygate bug)
 const error = ref(null)
 
 // Captured on loadCredits() call; reused by startCheckout() so it doesn't need a parameter
@@ -106,14 +132,18 @@ export function useCreditLedger() {
 
   /**
    * Loads the credit ledger from the pod.
-   * Sets balance and ledger reactively. 404 is treated as empty ledger (first-time user).
+   * Sets balance and ledger reactively. 404 is treated as empty ledger (first-time user),
+   * unless webId is in FREE_CREDIT_WEBIDS — in that case the ledger is seeded with
+   * FREE_CREDIT_AMOUNT credits and written to the pod immediately.
    *
    * @param {string} podRoot - Pod root URL without trailing slash.
    * @param {string} bearerToken - User's current Solid OIDC access token.
    * @param {Function} [authenticatedFetch] - DPoP-authenticated session.fetch. Falls back
    *   to ur.hyperFetch if not provided (legacy path — may return Turtle for JSON resources).
+   * @param {string} [webId] - The authenticated user's WebID. Used to match FREE_CREDIT_WEBIDS.
    *
    * Spec: 3P.F.ContributionFlow — credits displayed after purchase round-trip completes
+   *       Evo9.WebIDFreeCredit — whitelisted WebIDs receive a 100K grant on first login
    */
   async function loadCredits(podRoot, bearerToken, authenticatedFetch, webId) {
     if (!podRoot) return
@@ -123,6 +153,9 @@ export function useCreditLedger() {
 
     loading.value = true
     error.value = null
+
+    // Cycle 19 follow-up #5: diagnostic logging — entry point.
+    console.info('[useCreditLedger] loadCredits start — webId:', webId || '(none)', 'podRoot:', podRoot)
 
     const ledgerUrl = podRoot + '/apps/TomTwin/thebrain-credits.json'
 
@@ -135,49 +168,40 @@ export function useCreditLedger() {
         headers: { 'Accept': 'application/json' }
       })
 
+      // Cycle 19 follow-up #3 (2026-04-28): TwinPod returns 200 (NOT 404) with
+      // fabricated JSON-LD metadata for resources that don't exist. We can no
+      // longer rely on `response.status === 404` to detect first-time users.
+      // Instead, use Option C from Reference_Code_TwinPod-DefaultContainers.md:
+      // a combined content-location + shape check. See
+      // src/composables/util/twinpod-resource-exists.js.
+      let parsedBody = null
+      let isGenuineLedger = false
       if (response.ok) {
-        const data = await response.json()
+        try {
+          parsedBody = await response.json()
+        } catch {
+          parsedBody = null
+        }
+        isGenuineLedger = parsedBody !== null && isRealTwinPodResource(
+          response,
+          parsedBody,
+          d => typeof d?.balance === 'number'
+        )
+      }
+
+      if (response.ok && isGenuineLedger) {
+        const data = parsedBody
         balance.value = data.balance ?? 0
         ledger.value = data.ledger ?? []
         // Spec: Evo3a.TrialSchemaAndGate — null-safe: missing fields on existing
         // ledgers treated as false/null so existing users are not affected.
         trialUsed.value = data.trialUsed ?? false
         trialStartedAt.value = data.trialStartedAt ?? null
-
-        // Spec: Evo9.WebIDFreeCredit (recovery / grant-on-top branch) — if a
-        // whitelisted WebID has an existing ledger AND no prior `grant` entry,
-        // apply the 100K grant idempotently. Adds 100K on top of whatever balance
-        // already exists (e.g. Tommy paid 500 → ends up with 100,500). Guarded by
-        // the "no prior grant" check so it can never re-grant.
-        const hasPriorGrant = (ledger.value || []).some(e => e?.type === 'grant')
-        if (webId && FREE_CREDIT_WEBIDS.includes(webId) && !hasPriorGrant) {
-          const now = new Date().toISOString()
-          const newBalance = (balance.value || 0) + FREE_CREDIT_AMOUNT
-          const grantedLedger = {
-            ...data,
-            balance: newBalance,
-            ledger: [...(data.ledger || []), { type: 'grant', credits: FREE_CREDIT_AMOUNT, reason: 'whitelist', ts: now }],
-            updatedAt: now
-          }
-          balance.value = newBalance
-          ledger.value = grantedLedger.ledger
-          try {
-            await ensureContainer(podRoot + '/apps/', fetcher)
-            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher)
-            const putRes = await fetcher(ledgerUrl, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(grantedLedger, null, 2)
-            })
-            if (!putRes.ok) {
-              console.warn('[useCreditLedger] Evo9 recovery grant PUT failed (non-fatal):', putRes.status)
-            }
-          } catch (e) {
-            console.warn('[useCreditLedger] Evo9 recovery grant write error (non-fatal):', e.message)
-          }
-        }
-      } else if (response.status === 404) {
-        // First-time user — no ledger yet
+        console.info('[useCreditLedger] loadCredits — existing ledger loaded, balance:', balance.value)
+      } else if (response.ok || response.status === 404) {
+        // First-time user — pod has no ledger yet. Either the pod returned 404
+        // (legacy / non-TwinPod servers) or 200 with fabricated metadata
+        // (TwinPod). Both routes converge here.
         // Spec: Evo9.WebIDFreeCredit — whitelisted WebIDs get a 100K grant on first login.
         // Non-whitelisted users stay at 0 (existing trial flow applies).
         if (webId && FREE_CREDIT_WEBIDS.includes(webId)) {
@@ -194,27 +218,36 @@ export function useCreditLedger() {
           ledger.value = initialLedger.ledger
           trialUsed.value = false
           trialStartedAt.value = null
+          // Cycle 19 follow-up #5: whitelist branch matched.
+          console.info('[useCreditLedger] whitelist grant applied — webId:', webId, 'balance set to:', FREE_CREDIT_AMOUNT)
 
           // Write the initial ledger to the pod so subsequent logins load it normally
           try {
-            await ensureContainer(podRoot + '/apps/', fetcher)
-            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher)
+            await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
             const putRes = await fetcher(ledgerUrl, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(initialLedger, null, 2)
             })
-            if (!putRes.ok) {
-              console.warn('[useCreditLedger] Evo9 grant PUT failed (non-fatal):', putRes.status)
+            if (putRes && putRes.ok === false) {
+              console.warn('[useCreditLedger] whitelist grant PUT non-OK:', putRes.status)
+            } else {
+              console.info('[useCreditLedger] whitelist grant PUT ok')
             }
-          } catch (e) {
-            console.warn('[useCreditLedger] Evo9 grant write error (non-fatal):', e.message)
+          } catch (writeErr) {
+            // Non-fatal — balance is already set reactively; pod write is best-effort
+            console.warn('[useCreditLedger] Whitelist grant pod write failed (non-fatal):', writeErr)
           }
         } else {
+          // Non-whitelisted first-time user — use defaults (free trial flow)
           balance.value = 0
           ledger.value = []
           trialUsed.value = false
           trialStartedAt.value = null
+          // Cycle 19 follow-up #5: whitelist branch did NOT match.
+          const reason = !webId ? 'webId missing' : 'webId not in FREE_CREDIT_WEBIDS'
+          console.info('[useCreditLedger] no whitelist grant — reason:', reason, 'webId:', webId || '(none)')
         }
       } else {
         console.error('[useCreditLedger] Unexpected status loading ledger:', response.status)
@@ -240,11 +273,16 @@ export function useCreditLedger() {
    */
   async function startCheckout(priceId) {
     if (!priceId || !_podRoot) {
-      console.error('[useCreditLedger] startCheckout requires priceId and podRoot to be set')
+      console.error('[useCreditLedger] startCheckout requires priceId and podRoot to be set', { priceId: !!priceId, _podRoot: !!_podRoot })
+      // Show a visible error so the user sees feedback rather than silent failure.
+      // Most common cause: this useCreditLedger instance was never initialised via
+      // loadCredits (dual-instance / module dedup issue). See provide('startCheckout')
+      // in App.vue — the injected version is always the correctly initialised instance.
+      error.value = 'Checkout error — please reload and try again.'
       return
     }
 
-    loading.value = true
+    checkoutLoading.value = true
     error.value = null
 
     try {
@@ -280,8 +318,9 @@ export function useCreditLedger() {
       console.error('[useCreditLedger] Network error starting checkout:', err)
       error.value = 'Could not reach checkout. Please try again.'
     } finally {
-      // Note: loading stays true through the redirect; no need to reset in the success path
-      loading.value = false
+      // Note: checkoutLoading stays true through the Stripe redirect in the success path;
+      // reset on error so the button re-enables after a failed attempt.
+      checkoutLoading.value = false
     }
   }
 
@@ -333,18 +372,26 @@ export function useCreditLedger() {
           headers: { 'Accept': 'application/json' }
         })
         if (getRes.ok) {
-          const existing = await getRes.json()
-          currentLedger = {
-            balance: existing.balance ?? 0,
-            ledger: existing.ledger ?? [],
-            processedEvents: existing.processedEvents ?? [],
-            updatedAt: existing.updatedAt ?? null,
-            // Null-safe: missing fields on existing ledgers default to false/null
-            trialUsed: existing.trialUsed ?? false,
-            trialStartedAt: existing.trialStartedAt ?? null
+          // Cycle 19 follow-up #3 (2026-04-28): TwinPod returns 200 with
+          // fabricated metadata for non-existent resources. Verify the body
+          // is a real ledger before consuming it; otherwise treat as
+          // first-purchase and keep the empty default. Avoids zeroing a
+          // credited user's ledger when the GET returns fabricated JSON-LD.
+          let existing = null
+          try { existing = await getRes.json() } catch { existing = null }
+          if (existing && isRealTwinPodResource(getRes, existing, d => typeof d?.balance === 'number')) {
+            currentLedger = {
+              balance: existing.balance ?? 0,
+              ledger: existing.ledger ?? [],
+              processedEvents: existing.processedEvents ?? [],
+              updatedAt: existing.updatedAt ?? null,
+              // Null-safe: missing fields on existing ledgers default to false/null
+              trialUsed: existing.trialUsed ?? false,
+              trialStartedAt: existing.trialStartedAt ?? null
+            }
           }
         }
-        // 404 = no ledger yet — use empty (user's first purchase)
+        // 404 / fabricated 200 = no ledger yet — use empty (user's first purchase)
       } catch (e) {
         console.warn('[useCreditLedger] GET ledger error (using empty):', e)
       }
@@ -377,8 +424,8 @@ export function useCreditLedger() {
 
       if (didUpdate) {
         // Ensure parent containers exist before writing
-        await ensureContainer(_podRoot + '/apps/', authenticatedFetch)
-        await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch)
+        await ensureContainer(_podRoot + '/apps/', authenticatedFetch, { slug: 'apps', label: 'Apps' })
+        await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
 
         // Write updated ledger to pod using DPoP-authenticated session.fetch
         const putRes = await authenticatedFetch(ledgerUrl, {
@@ -449,6 +496,19 @@ export function useCreditLedger() {
       return
     }
 
+    // Cycle 19 follow-up #2 (2026-04-28): defensive guard against zeroing a credited
+    // user's balance. A credited user (whitelist grant, recovery, purchase, carryover)
+    // must NEVER have trial state written to their pod ledger. The App.vue watcher
+    // already gates this via `if (creditBalance.value > 0) return`, but a stale
+    // in-memory `balance.value` (mid-load race) or a transient pod GET failure
+    // could otherwise let the spread fall back to balance=0 and clobber the real
+    // ledger. This belt-and-suspenders check ensures the historical zeroing bug
+    // cannot recur even if the upstream gate is bypassed.
+    if (balance.value > 0) {
+      console.warn('[useCreditLedger] writeTrialStart skipped — user has positive balance:', balance.value)
+      return
+    }
+
     // Update reactive state immediately (optimistic)
     trialUsed.value = true
     trialStartedAt.value = ts
@@ -464,22 +524,64 @@ export function useCreditLedger() {
         trialUsed: false,
         trialStartedAt: null
       }
+      let getSucceeded = false
+      // getHttpOk is true whenever the HTTP layer gave us a definitive answer
+      // (2xx or 404) — meaning we know the pod's state and a write is safe.
+      // getSucceeded is only true when the body was a real ledger with a balance field.
+      // The distinction matters because TwinPod fabricates 200 for non-existent resources
+      // (instead of returning 404), so getSucceeded=false with getHttpOk=true means
+      // "no real ledger exists yet" — safe to write. getHttpOk=false means an HTTP
+      // error (5xx, 401, 403, network failure) — pod state is unknown, abort.
+      let getHttpOk = false
       try {
         const getRes = await authenticatedFetch(ledgerUrl, {
           method: 'GET',
           headers: { 'Accept': 'application/json' }
         })
+        // 2xx or 404 both mean "we know what's there" — safe to act on the result
+        if (getRes.ok || getRes.status === 404) getHttpOk = true
         if (getRes.ok) {
-          const data = await getRes.json()
-          existing = { ...existing, ...data }
+          // Cycle 19 follow-up #3: TwinPod 200-not-404 quirk — only treat the
+          // GET as a successful prove-balance read when the body is a real
+          // ledger. A fabricated 200 with no `balance` field cannot prove
+          // balance is 0, so getSucceeded stays false.
+          let data = null
+          try { data = await getRes.json() } catch { data = null }
+          if (data && isRealTwinPodResource(getRes, data, d => typeof d?.balance === 'number')) {
+            existing = { ...existing, ...data }
+            getSucceeded = true
+          }
         }
       } catch (e) {
         console.warn('[useCreditLedger] writeTrialStart GET failed (using in-memory state):', e)
       }
 
+      // Cycle 19 follow-up #2 (2026-04-28): if the pod ledger reports a positive
+      // balance, abort — this is a credited user and trial state must not be written.
+      // The optimistic in-memory trialUsed/trialStartedAt updates are kept (the trial
+      // is active server-side via KV); only the destructive pod write is suppressed.
+      if (existing.balance > 0) {
+        console.warn('[useCreditLedger] writeTrialStart aborted — pod ledger has positive balance:', existing.balance)
+        // Sync in-memory balance to the pod-confirmed value so the App.vue gate
+        // and the trial-timer computed wrapper see the credited state.
+        balance.value = existing.balance
+        return
+      }
+      // Bug fix (2026-05-01): was `if (!getSucceeded) return` — too aggressive.
+      // A TwinPod fabricated 200 sets getHttpOk=true but getSucceeded=false (no real
+      // ledger body). The old guard aborted the write for first-time users, so the
+      // trial timestamp was never persisted to the pod. On every reload/login,
+      // loadCredits() found no stored trial state and the Worker issued a fresh 10 min.
+      // Fix: gate on getHttpOk (HTTP layer gave a definitive response) instead of
+      // getSucceeded (real ledger was present). Only abort on true HTTP failures.
+      if (!getHttpOk) {
+        console.warn('[useCreditLedger] writeTrialStart aborted — GET request failed (5xx/401/403/network); pod state unknown, not writing')
+        return
+      }
+
       // Ensure parent containers exist
-      await ensureContainer(_podRoot + '/apps/', authenticatedFetch)
-      await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch)
+      await ensureContainer(_podRoot + '/apps/', authenticatedFetch, { slug: 'apps', label: 'Apps' })
+      await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
 
       const updated = { ...existing, trialUsed: true, trialStartedAt: ts, updatedAt: new Date().toISOString() }
       const putRes = await authenticatedFetch(ledgerUrl, {
@@ -538,8 +640,17 @@ export function useCreditLedger() {
           headers: { 'Accept': 'application/json' }
         })
         if (getRes.ok) {
-          const data = await getRes.json()
-          existing = { ...existing, ...data }
+          // Cycle 19 follow-up #3: TwinPod 200-not-404 quirk — only spread
+          // the GET body when it is a real ledger. Fabricated metadata has
+          // no `balance` field; the spread would silently leave in-memory
+          // values intact (which is the correct fallback anyway), but being
+          // explicit makes the intent obvious and matches the pattern used
+          // in loadCredits / applyPendingCredits / writeTrialStart.
+          let data = null
+          try { data = await getRes.json() } catch { data = null }
+          if (data && isRealTwinPodResource(getRes, data, d => typeof d?.balance === 'number')) {
+            existing = { ...existing, ...data }
+          }
         }
       } catch (e) {
         console.warn('[useCreditLedger] decrementCredit GET failed (using in-memory state):', e)
@@ -581,7 +692,8 @@ export function useCreditLedger() {
     trialUsed,
     trialStartedAt,
     ledger,
-    loading,
+    loading,           // tracks loadCredits / applyPendingCredits — used by App.vue timer mask
+    checkoutLoading,   // tracks startCheckout only — used by BuyCreditsButton :disabled binding
     error,
     loadCredits,
     startCheckout,
