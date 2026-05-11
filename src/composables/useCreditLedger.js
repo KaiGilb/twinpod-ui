@@ -59,11 +59,14 @@ import { isRealTwinPodResource } from './util/twinpod-resource-exists.js'
 // gate, meter, and telemetry — usage is tracked, not bypassed.
 // Cycle 19 follow-up #5 (2026-04-28): added tst-heppa and tst-testertom to unblock
 // fresh-pod testing of the whitelist branch.
+// 2026-05-10 (BestSavedProjectFileFormat sub-cycle): added tst-planner for typed-JSON
+// session-format browser testing on the no-books branch.
 const FREE_CREDIT_WEBIDS = [
   'https://kai.gilb.com/i',
   'https://tommy.gilb.com/i',
   'https://tst-heppa.demo.systemtwin.com/i',
-  'https://tst-testertom.demo.systemtwin.com/i'
+  'https://tst-testertom.demo.systemtwin.com/i',
+  'https://tst-planner.demo.systemtwin.com/i'
 ]
 const FREE_CREDIT_AMOUNT = 100000
 

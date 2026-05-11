@@ -4,8 +4,8 @@
  * useSessionIndex
  *
  * Manages the session index for The Brain app: a JSON file at
- * {podRoot}/home/thebrain-sessions/index.json containing session metadata,
- * and individual session .md files at {podRoot}/home/thebrain-sessions/{id}.md.
+ * {podRoot}/home/TomTwinProjects/index.json containing session metadata,
+ * and individual session .md files at {podRoot}/home/TomTwinProjects/{id}.md.
  *
  * Storage path is governed by the single module-level constant SESSIONS_ROOT_PATH.
  * Changing the sessions storage location means editing one line — no other file
@@ -23,7 +23,7 @@
  *
  * Subdirectory support: CONFIRMED via Cycle 12 (LDP BasicContainer PUT to
  * {podRoot}/home/TomTwin/ succeeded). The same pattern is used for
- * SESSIONS_ROOT_PATH = '/home/thebrain-sessions'. Container creation is
+ * SESSIONS_ROOT_PATH = '/home/TomTwinProjects'. Container creation is
  * idempotent — 409 is acceptable.
  *
  * @param {{ document: import('vue').Ref<string> }} workbookRefs
@@ -72,10 +72,32 @@ import { ur } from '@kaigilb/twinpod-client'
 // All path construction in this file uses this constant.
 // No other file may hardcode this path string.
 // Confirmed: pod /home/ surface supports subdirectory PUT (Cycle 12, LDP BasicContainer pattern).
-// To use flat-file fallback, change this to '/home/thebrain-sessions' prefix and adjust
+// To use flat-file fallback, change this to '/home/TomTwinProjects' prefix and adjust
 // _sessionsRoot() to return podRoot + SESSIONS_ROOT_PATH (no trailing slash) as a prefix
 // rather than a directory.
-const SESSIONS_ROOT_PATH = '/home/thebrain-sessions'
+const SESSIONS_ROOT_PATH = '/home/TomTwinProjects'
+
+// Legacy path — the original production location for session files (pre-Cycle-021).
+// Read-only fallback to surface existing user data after the path rename. Saves always
+// go to the new SESSIONS_ROOT_PATH; legacy files are auto-migrated on next save (the
+// old file remains as a historical artefact, not deleted).
+// Source: Kai, 2026-05-11 — one production user has data here; do not orphan their projects.
+const LEGACY_SESSIONS_ROOT_PATH = '/home/thebrain-sessions'
+
+// --- Typed-block document schema ---
+//
+// Spec: 4Sol.S.TwinPodSessionIndex (revised 2026-05-10) — typed-JSON-document format.
+// Each session file is a JSON document whose `blocks` array contains typed-block objects.
+// The block kind is an extension point: adding a new kind is a registry-extension change,
+// NOT a document-schema-version bump. The document's `schemaVersion` only changes when
+// the top-level document shape changes (e.g. a new top-level key is added that older code
+// must migrate). New block kinds extend BLOCK_KINDS below.
+//
+// For the bootstrap increment (TypedJSONDocSessionFormat), only 'markdown_text' is defined.
+const DOC_SCHEMA_VERSION = 1
+const BLOCK_KINDS = {
+  markdown_text: { version: 1 }
+}
 
 // Module-level state so App.vue and all injected children share the same reactive refs.
 const sessionList = ref([])
@@ -89,6 +111,12 @@ const sessionSaveError = ref(null)
 // Set to true by watch on workbookContent after initial load.
 // Reset to false before each saveCurrentSession() call (prevent double-save race).
 const isDirty = ref(false)
+
+// Per-session in-memory metadata: created timestamp (preserved across saves) and a
+// legacy-loaded flag (set when a session was loaded from the legacy JSON-in-.md or
+// text+frontmatter shape, so we know the next save persists in the new .json shape).
+// Keyed by session id. Not persisted — re-derived from the loaded body.
+const _sessionMeta = new Map()
 
 // podRoot captured from App.vue provide context — set once at loadIndex() call time.
 let _podRoot = ''
@@ -111,6 +139,7 @@ export function _resetModuleStateForTesting() {
   isDirty.value = false
   _podRoot = ''
   _autosaveTimer = null
+  _sessionMeta.clear()
 }
 
 export function useSessionIndex({ document }) {
@@ -128,12 +157,25 @@ export function useSessionIndex({ document }) {
   }
 
   /**
+   * Returns the LEGACY sessions container URL for the current pod.
+   * Used by loadIndex and loadSession for read-only fallback so existing user data
+   * surfaces after the SESSIONS_ROOT_PATH rename. Saves always target sessionsRoot().
+   * @returns {string}
+   */
+  function legacySessionsRoot() {
+    return _podRoot.replace(/\/+$/, '') + LEGACY_SESSIONS_ROOT_PATH
+  }
+
+  /**
    * Ensures the sessions container exists on the pod using an LDP BasicContainer PUT.
    * Idempotent — 409 (already exists) is treated as success.
    * Uses the same pattern as Cycle 12 (usePodWorkbook.js container creation).
    * @returns {Promise<void>}
    */
   async function ensureSessionsContainer() {
+    // /home/ exists by default on TwinPod, so we only need to ensure the leaf container.
+    // PUT is idempotent (409 = already exists). The TwinPodData container at /apps/TomTwin/
+    // is ensured by useCreditLedger / useUserFactStore — not our concern here.
     const containerUrl = sessionsRoot() + '/'
     await ur.hyperFetch(containerUrl, {
       method: 'PUT',
@@ -142,10 +184,10 @@ export function useSessionIndex({ document }) {
         'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
       },
       // rdfs:label gives the container a human-readable name in the pod browser.
-      body: '@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "TheBrainSessions" .\n'
+      body: '@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "TomTwinProjects" .\n'
     })
-    // 409 = container already exists — acceptable; we do not check the response status here
-    // because the PUT of the workbook file immediately after will surface auth failures.
+    // 409 = already exists — acceptable; response status not checked here because
+    // the file PUT immediately after will surface real auth/network failures.
   }
 
   // --- Session ID generation ---
@@ -190,36 +232,69 @@ export function useSessionIndex({ document }) {
     // Ensure the sessions container exists before trying to read/write inside it.
     await ensureSessionsContainer()
 
-    const indexUrl = sessionsRoot() + '/index.json'
+    /**
+     * Fetches an index.json from a given root URL.
+     * Returns { entries, status } where entries is the parsed array (or null on miss)
+     * and status is the HTTP status code (or 0 on network error).
+     * Never throws — caller decides how to merge.
+     */
+    async function fetchIndex(rootUrl) {
+      try {
+        const response = await ur.hyperFetch(rootUrl + '/index.json', {
+          method: 'GET',
+          headers: { accept: 'application/json' }
+        })
+        if (response.ok) {
+          const text = await response.text()
+          try {
+            const parsed = JSON.parse(text)
+            if (Array.isArray(parsed)) return { entries: parsed, status: response.status }
+          } catch {
+            // Body wasn't JSON (e.g. TwinPod 200-not-404 returning Turtle for a missing
+            // resource). Treat as absent.
+          }
+          return { entries: null, status: response.status }
+        }
+        return { entries: null, status: response.status }
+      } catch {
+        return { entries: null, status: 0 }
+      }
+    }
 
     try {
-      // Use ur.hyperFetch with Accept: application/json for plain JSON reads.
-      // This routes through the authenticated session (single-namespace rule).
-      const response = await ur.hyperFetch(indexUrl, {
-        method: 'GET',
-        headers: { accept: 'application/json' }
-      })
+      // Read the canonical (new) index first.
+      const primary = await fetchIndex(sessionsRoot())
+      // Then read the legacy index (read-only, for migrating users with pre-rename data).
+      const legacy = await fetchIndex(legacySessionsRoot())
 
-      if (response.ok) {
-        const text = await response.text()
-        const parsed = JSON.parse(text)
-        // Backward compat: older entries missing the project field default to 'The Brain'.
-        sessionList.value = parsed.map(entry => ({
-          ...entry,
-          project: entry.project ?? 'The Brain'
-        }))
-        return
+      // Merge: new index entries win on id collision (a re-saved legacy session has
+      // moved into the new index and should not appear twice).
+      const merged = new Map()
+      if (Array.isArray(legacy.entries)) {
+        for (const entry of legacy.entries) {
+          merged.set(entry.id, { ...entry, project: entry.project ?? 'The Brain' })
+        }
+      }
+      if (Array.isArray(primary.entries)) {
+        for (const entry of primary.entries) {
+          merged.set(entry.id, { ...entry, project: entry.project ?? 'The Brain' })
+        }
       }
 
-      if (response.status === 404) {
-        // First use — no index.json yet. Treat as empty list, no error.
+      // Both sources missing AND both responded non-404 → treat as a real error.
+      // Otherwise: 404 on either is just "first use" or "no legacy data" — fine.
+      const primaryReal = primary.status !== 0 && primary.status !== 404
+      const legacyReal = legacy.status !== 0 && legacy.status !== 404
+      if (
+        primary.entries === null && legacy.entries === null
+        && (primaryReal || legacyReal)
+      ) {
+        indexLoadError.value = 'Could not load session index from TwinPod.'
         sessionList.value = []
         return
       }
 
-      // Any other non-ok status is a real error.
-      indexLoadError.value = 'Could not load session index from TwinPod.'
-      sessionList.value = []
+      sessionList.value = Array.from(merged.values())
     } catch {
       indexLoadError.value = 'Could not load session index from TwinPod.'
       sessionList.value = []
@@ -255,7 +330,7 @@ export function useSessionIndex({ document }) {
    * Creates a new session entry, appends it to sessionList, saves the index,
    * and sets the new session as active.
    *
-   * The new session gets a default name 'New Session — YYYY-MM-DD'.
+   * The new project gets a default name 'Project' (user can rename inline immediately).
    * project defaults to 'The Brain'.
    *
    * Spec: 3P.F.SessionCreate
@@ -269,8 +344,7 @@ export function useSessionIndex({ document }) {
       await saveCurrentSession(currentName)
     }
 
-    const today = new Date().toISOString().slice(0, 10)   // 'YYYY-MM-DD'
-    const name = `New Session — ${today}`
+    const name = 'Project'
     const id = generateSessionId(name)
     const lastModified = new Date().toISOString()
 
@@ -313,20 +387,44 @@ export function useSessionIndex({ document }) {
     isDirty.value = false
 
     const id = activeSessionId.value
-    const sessionFileUrl = sessionsRoot() + '/' + id + '.md'
+    // Spec: 4Sol.S.TwinPodSessionIndex (revised 2026-05-10) — session file is written
+    // as a typed-JSON-document at {id}.json (extension matches the content honestly).
+    // The legacy {id}.md file (if any) is NOT deleted on legacy → new conversion; it
+    // remains as a historical artifact on the pod per spec "Old .md filename handling".
+    const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
 
-    // Store the session as a JSON object so the pod serves it back as application/json.
-    // text/markdown caused a MIME negotiation failure: the pod returned Turtle on GET
-    // because it does not recognise text/markdown as a supported content type.
-    // application/json is confirmed to work — the index.json follows the same pattern.
-    // Spec: 4Sol.S.TwinPodSessionIndex — session file contains session_name, session_project, content.
     const project = sessionList.value.find(s => s.id === id)?.project ?? 'The Brain'
-    const sessionData = {
-      session_name: name,
-      session_project: project,
-      content: document.value ?? ''
+    const nowIso = new Date().toISOString()
+    // Preserve created timestamp across saves (in-memory meta map). For sessions that
+    // never had a stored created timestamp (new sessions in this build, or legacy
+    // sessions migrated on this save), default to now() — this becomes the canonical
+    // created on disk going forward.
+    const existingMeta = _sessionMeta.get(id) ?? {}
+    const created = existingMeta.created ?? nowIso
+
+    // Block-id strategy: deterministic, stable per session.
+    // For the bootstrap single-block case we use `${id}-block-1` so re-saves keep the
+    // same block id. Future plugins that add/insert blocks should generate ids via
+    // UUID v4 (or another collision-resistant scheme); the spec only requires stability
+    // per block, not a specific format.
+    const blockId = `${id}-block-1`
+    const sessionDoc = {
+      schemaVersion: DOC_SCHEMA_VERSION,
+      id,
+      name,
+      project,
+      created,
+      lastModified: nowIso,
+      blocks: [
+        {
+          id: blockId,
+          kind: 'markdown_text',
+          version: BLOCK_KINDS.markdown_text.version,
+          text: document.value ?? ''
+        }
+      ]
     }
-    const body = JSON.stringify(sessionData)
+    const body = JSON.stringify(sessionDoc)
 
     try {
       const fileResponse = await ur.uploadFile(sessionFileUrl, body, 'application/json')
@@ -337,10 +435,13 @@ export function useSessionIndex({ document }) {
         return
       }
 
+      // Successful save — update meta. Clear the legacy-loaded flag so future loads
+      // skip the .md fallback once the new .json exists.
+      _sessionMeta.set(id, { created, legacyLoaded: false })
+
       // Update the index entry.
-      const lastModified = new Date().toISOString()
       sessionList.value = sessionList.value.map(s =>
-        s.id === id ? { ...s, name, lastModified } : s
+        s.id === id ? { ...s, name, lastModified: nowIso } : s
       )
 
       await saveIndex()
@@ -354,47 +455,112 @@ export function useSessionIndex({ document }) {
   }
 
   /**
-   * Fetches the .md file for a session and returns its content as a string.
-   * Strips frontmatter before returning so the workspace shows clean content.
+   * Fetches the session file for `id` and returns its markdown content as a string.
    *
-   * Spec: 3P.F.SessionSwitch read path.
+   * Spec: 4Sol.S.TwinPodSessionIndex (revised 2026-05-10) — read path tries {id}.json
+   * first (new typed-JSON-document shape). On 404, falls back to {id}.md, which may
+   * hold either the legacy JSON-in-.md shape or the older text+YAML-frontmatter shape.
+   * On legacy load, the legacy file is NOT rewritten; the user's next save persists
+   * in the new .json shape (auto-convert at next save).
+   *
+   * For the bootstrap increment (TypedJSONDocSessionFormat) only the markdown text of
+   * the first block is returned, so the workspace ref stays a plain string. Future
+   * increments may return the full blocks array instead.
+   *
+   * Spec: 3P.F.SessionSwitch read path; 4Sol.S.TwinPodSessionIndex backward-compatibility.
    * @param {string} id - Session ID.
-   * @returns {Promise<string>} Raw markdown content (frontmatter stripped).
+   * @returns {Promise<string>} Markdown content (legacy frontmatter stripped if present).
    */
   async function loadSession(id) {
     if (!_podRoot || !id) return ''
 
-    const sessionFileUrl = sessionsRoot() + '/' + id + '.md'
-
-    const response = await ur.hyperFetch(sessionFileUrl, {
+    // --- Try {id}.json first (new typed-JSON-document shape) ---
+    const jsonUrl = sessionsRoot() + '/' + id + '.json'
+    const jsonResponse = await ur.hyperFetch(jsonUrl, {
       method: 'GET',
       headers: { accept: 'application/json' }
     })
 
-    if (!response.ok) {
-      // 404 = session file not saved yet — return empty content.
-      if (response.status === 404) return ''
-      throw new Error(`Could not load session (HTTP ${response.status}).`)
-    }
-
-    const text = await response.text()
-
-    // New format (application/json): extract the content field.
-    // Old format (text/markdown with YAML frontmatter): strip frontmatter and return raw text.
-    // The try/catch handles the transition: sessions saved before the JSON format
-    // change fall through to the frontmatter-strip path.
-    try {
-      const parsed = JSON.parse(text)
-      if (typeof parsed.content === 'string') {
-        return parsed.content
+    if (jsonResponse.ok) {
+      // MIME-negotiation gotcha (curated memory pod-json-read-write.md): in principle
+      // ur.hyperFetch can return Turtle for a .json file if the server matches text/turtle
+      // first. We send `accept: application/json` (mirrors loadIndex pattern, which works
+      // empirically) and shape-check the parsed body below — non-JSON or non-matching
+      // shape falls through to the .md fallback rather than crashing.
+      const text = await jsonResponse.text()
+      try {
+        const parsed = JSON.parse(text)
+        // New typed-JSON-document: has schemaVersion AND blocks array.
+        if (typeof parsed.schemaVersion === 'number' && Array.isArray(parsed.blocks)) {
+          _sessionMeta.set(id, { created: parsed.created, legacyLoaded: false })
+          // Extract markdown from the first markdown_text block (bootstrap single-block).
+          const firstMarkdown = parsed.blocks.find(b => b?.kind === 'markdown_text')
+          return typeof firstMarkdown?.text === 'string' ? firstMarkdown.text : ''
+        }
+        // Body parsed but shape doesn't match new doc — treat as "no real saved session"
+        // (matches the TwinPod 200-not-404 fabricated-response quirk).
+        return ''
+      } catch {
+        // Body wasn't JSON at all (e.g. server returned Turtle despite the .json URL).
+        // Fall through to the legacy .md path below.
       }
-    } catch {
-      // Not JSON — fall through to old-format handling.
+    } else if (jsonResponse.status !== 404) {
+      // Real HTTP error on the .json GET — propagate.
+      throw new Error(`Could not load session (HTTP ${jsonResponse.status}).`)
     }
 
-    // Old format fallback: strip YAML frontmatter if present.
-    const frontmatterRe = /^---\r?\n[\s\S]*?\r?\n---\r?\n\n?/
-    return text.replace(frontmatterRe, '')
+    // --- Fallback chain: try {id}.md at the new path, then at the legacy path. ---
+    //
+    // The new container holds .md files only from a brief intermediate state during the
+    // 2026-05 path renames; in production the .md files live at the legacy path. We try
+    // the new container first (cheap, idempotent) then the legacy container so users
+    // with pre-rename data still see their projects. Saves always go to the new path
+    // — the legacy file remains as a historical artefact.
+    async function tryLoadFromMdUrl(mdUrl) {
+      const mdResponse = await ur.hyperFetch(mdUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json' }
+      })
+      if (!mdResponse.ok) {
+        return { found: false, status: mdResponse.status, content: '' }
+      }
+      const mdText = await mdResponse.text()
+      // Legacy JSON-in-.md shape: { session_name, session_project, content }.
+      try {
+        const legacy = JSON.parse(mdText)
+        if (typeof legacy?.content === 'string') {
+          return { found: true, status: 200, content: legacy.content }
+        }
+      } catch {
+        // Not JSON — fall through to text+frontmatter handling.
+      }
+      // Older legacy: text + YAML frontmatter. Strip frontmatter; body is markdown.
+      const frontmatterRe = /^---\r?\n[\s\S]*?\r?\n---\r?\n\n?/
+      return { found: true, status: 200, content: mdText.replace(frontmatterRe, '') }
+    }
+
+    // Try new path first.
+    const newMdResult = await tryLoadFromMdUrl(sessionsRoot() + '/' + id + '.md')
+    if (newMdResult.found) {
+      _sessionMeta.set(id, { created: new Date().toISOString(), legacyLoaded: true })
+      return newMdResult.content
+    }
+    if (newMdResult.status !== 404) {
+      throw new Error(`Could not load session (HTTP ${newMdResult.status}).`)
+    }
+
+    // Try legacy path. Users with pre-rename data live here.
+    const legacyMdResult = await tryLoadFromMdUrl(legacySessionsRoot() + '/' + id + '.md')
+    if (legacyMdResult.found) {
+      _sessionMeta.set(id, { created: new Date().toISOString(), legacyLoaded: true })
+      return legacyMdResult.content
+    }
+    if (legacyMdResult.status !== 404) {
+      throw new Error(`Could not load session (HTTP ${legacyMdResult.status}).`)
+    }
+
+    // Both new and legacy paths returned 404 → no session file anywhere → empty content.
+    return ''
   }
 
   /**
@@ -454,28 +620,52 @@ export function useSessionIndex({ document }) {
     await saveIndex()
 
     // Also update the session file if it exists.
-    // Best-effort: if the file doesn't exist yet, ignore the 404.
-    // On next saveCurrentSession() the new name will be written.
-    const sessionFileUrl = sessionsRoot() + '/' + id + '.md'
-    const fileResponse = await ur.hyperFetch(sessionFileUrl, {
+    // Best-effort: try the new {id}.json first (typed-JSON-document shape). If that
+    // is not present, fall back to legacy {id}.md (JSON-in-.md shape). If neither
+    // exists yet, no-op — the new name is already in index.json and the session file
+    // will be written on the next saveCurrentSession() in the new shape.
+    const jsonUrl = sessionsRoot() + '/' + id + '.json'
+    const jsonResponse = await ur.hyperFetch(jsonUrl, {
       method: 'GET',
       headers: { accept: 'application/json' }
     })
 
-    if (fileResponse.ok) {
-      const existingText = await fileResponse.text()
+    if (jsonResponse.ok) {
+      const existingText = await jsonResponse.text()
       try {
-        // New JSON format: parse, update session_name, write back.
         const existing = JSON.parse(existingText)
-        existing.session_name = trimmed
-        await ur.uploadFile(sessionFileUrl, JSON.stringify(existing), 'application/json')
+        if (typeof existing?.schemaVersion === 'number' && Array.isArray(existing?.blocks)) {
+          existing.name = trimmed
+          existing.lastModified = new Date().toISOString()
+          await ur.uploadFile(jsonUrl, JSON.stringify(existing), 'application/json')
+          return
+        }
       } catch {
-        // Not JSON (old text/markdown format or unexpected content).
-        // No-op — the updated name is already in index.json; the session file
-        // will be rewritten as JSON on the next saveCurrentSession().
+        // Shape mismatch — fall through to legacy .md try.
       }
     }
-    // 404 = file not yet saved; session_name will be written on next saveCurrentSession().
+
+    // Legacy fallback — only attempted if no .json exists. We rewrite the legacy
+    // session_name in place so old clients keep seeing the new name; subsequent
+    // saveCurrentSession() will write the new .json shape and supersede this.
+    const mdUrl = sessionsRoot() + '/' + id + '.md'
+    const mdResponse = await ur.hyperFetch(mdUrl, {
+      method: 'GET',
+      headers: { accept: 'application/json' }
+    })
+
+    if (mdResponse.ok) {
+      const existingText = await mdResponse.text()
+      try {
+        const existing = JSON.parse(existingText)
+        existing.session_name = trimmed
+        await ur.uploadFile(mdUrl, JSON.stringify(existing), 'application/json')
+      } catch {
+        // text+frontmatter or unexpected — leave file alone. index.json carries the
+        // authoritative name; next saveCurrentSession() writes the new .json shape.
+      }
+    }
+    // 404 on both = file not yet saved; name will be written on next saveCurrentSession().
   }
 
   /**
@@ -553,13 +743,22 @@ export function useSessionIndex({ document }) {
     // Persist the updated index.
     await saveIndex()
 
-    // Best-effort: delete the session file from the pod.
-    // No-op if the file was never content-saved (404) or if DELETE is not supported (405).
-    const sessionFileUrl = sessionsRoot() + '/' + id + '.md'
+    // Best-effort: delete the session file(s) from the pod. We try BOTH the new
+    // {id}.json (current write target) and the legacy {id}.md (historical artifact
+    // that may still exist for sessions created before the typed-JSON-document
+    // format). 404 / 405 / network errors on either are acceptable — the index has
+    // already been updated and is the authoritative session list.
+    const jsonUrl = sessionsRoot() + '/' + id + '.json'
+    const mdUrl = sessionsRoot() + '/' + id + '.md'
     try {
-      await ur.hyperFetch(sessionFileUrl, { method: 'DELETE' })
+      await ur.hyperFetch(jsonUrl, { method: 'DELETE' })
     } catch {
-      // Network error or method not allowed — acceptable; index is already updated.
+      // ignore
+    }
+    try {
+      await ur.hyperFetch(mdUrl, { method: 'DELETE' })
+    } catch {
+      // ignore
     }
   }
 

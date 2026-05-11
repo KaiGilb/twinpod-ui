@@ -431,7 +431,7 @@ export default {
     role="complementary" — this is a supporting navigation panel beside the main workspace.
     Spec: Rule_Code_accessibility — semantic HTML, WCAG 2.1 AA.
   -->
-  <aside class="session-panel" role="complementary" aria-label="Session panel">
+  <aside class="session-panel" role="complementary" aria-label="Project panel">
 
     <!-- ============================================================ -->
     <!-- Panel header — shows active session name + save button       -->
@@ -439,7 +439,7 @@ export default {
     <!-- ============================================================ -->
     <header class="session-panel__header">
       <h2 class="session-panel__title">
-        {{ activeSession ? activeSession.name : 'No active session' }}
+        {{ activeSession ? activeSession.name : 'No active project' }}
       </h2>
 
       <!--
@@ -452,7 +452,7 @@ export default {
         class="session-panel__save-btn"
         :disabled="sessionSaving"
         :aria-busy="sessionSaving || undefined"
-        aria-label="Save current session"
+        aria-label="Save current project"
         @click="onSave"
       >
         <span v-if="sessionSaving" class="session-panel__saving-dot" aria-hidden="true" />
@@ -485,7 +485,7 @@ export default {
       class="session-panel__new-btn"
       @click="onCreateNewSession"
     >
-      + New Session
+      + New Project
     </button>
 
     <!-- ============================================================ -->
@@ -503,7 +503,7 @@ export default {
       class="session-panel__empty"
       aria-live="polite"
     >
-      No saved sessions
+      No saved projects
     </p>
 
     <ul
@@ -540,7 +540,7 @@ export default {
             <button
               class="session-panel__session-btn"
               :disabled="!!switchingId || undefined"
-              :aria-label="`Switch to session: ${session.name}`"
+              :aria-label="`Switch to project: ${session.name}`"
               @click="onSessionClick(session.id)"
             >
               <span class="session-panel__name-text">{{ session.name }}</span>
@@ -554,7 +554,7 @@ export default {
             -->
             <button
               class="session-panel__rename-btn"
-              :aria-label="`Rename session: ${session.name}`"
+              :aria-label="`Rename project: ${session.name}`"
               @click.stop="activateNameRename(session)"
               @dblclick.stop="activateNameRename(session)"
             >
@@ -573,7 +573,7 @@ export default {
             <button
               class="session-panel__delete-btn"
               :class="{ 'is-armed': deletingId === session.id }"
-              :aria-label="`Delete session: ${session.name}`"
+              :aria-label="`Delete project: ${session.name}`"
               :aria-expanded="deletingId === session.id || undefined"
               @click.stop="armDelete(session.id)"
             >
@@ -586,13 +586,13 @@ export default {
 
           <!-- Name edit mode -->
           <template v-else>
-            <label :for="`name-input-${session.id}`" class="sr-only">Session name</label>
+            <label :for="`name-input-${session.id}`" class="sr-only">Project name</label>
             <input
               :id="`name-input-${session.id}`"
               v-model="renameNameValue"
               class="session-panel__rename-input"
               type="text"
-              placeholder="Session name…"
+              placeholder="Project name…"
               :aria-describedby="renameNameError ? `name-error-${session.id}` : undefined"
               @keydown="onNameInputKeydown($event, session.id)"
               @blur="confirmNameRename(session.id)"
@@ -618,10 +618,10 @@ export default {
           class="session-panel__delete-confirm"
           role="alert"
         >
-          <span class="session-panel__delete-confirm-text">Delete this session?</span>
+          <span class="session-panel__delete-confirm-text">Delete this project?</span>
           <button
             class="session-panel__delete-confirm-yes"
-            :aria-label="`Confirm delete session: ${session.name}`"
+            :aria-label="`Confirm delete project: ${session.name}`"
             @click.stop="confirmDelete(session.id)"
           >
             Delete
