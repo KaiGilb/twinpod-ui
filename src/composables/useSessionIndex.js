@@ -37,6 +37,7 @@
  *   indexLoadError:       import('vue').Ref<string|null>,
  *   sessionSaving:        import('vue').Ref<boolean>,
  *   sessionSaveError:     import('vue').Ref<string|null>,
+ *   isSessionLoading:     import('vue').Ref<boolean>,
  *   isDirty:              import('vue').Ref<boolean>,
  *   loadIndex:            () => Promise<void>,
  *   saveIndex:            () => Promise<void>,
@@ -107,6 +108,12 @@ const indexLoadError = ref(null)
 const sessionSaving = ref(false)
 const sessionSaveError = ref(null)
 
+// isSessionLoading drives the "Loading Project..." overlay in
+// WorkspacePane.vue. Set true while switchToSession() is in flight
+// (including any autosave of the outgoing session) and reset in a
+// finally block so a thrown loadSession does not leave it stuck.
+const isSessionLoading = ref(false)
+
 // isDirty tracks unsaved changes in workbookContent.
 // Set to true by watch on workbookContent after initial load.
 // Reset to false before each saveCurrentSession() call (prevent double-save race).
@@ -136,6 +143,7 @@ export function _resetModuleStateForTesting() {
   indexLoadError.value = null
   sessionSaving.value = false
   sessionSaveError.value = null
+  isSessionLoading.value = false
   isDirty.value = false
   _podRoot = ''
   _autosaveTimer = null
@@ -576,24 +584,35 @@ export function useSessionIndex({ document }) {
   async function switchToSession(id) {
     if (!id || id === activeSessionId.value) return
 
-    // Auto-save outgoing session if there are unsaved changes.
-    if (isDirty.value && activeSessionId.value) {
-      const currentName = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-        ?? 'Session'
-      await saveCurrentSession(currentName)
-    }
-
-    // Set new active session.
-    activeSessionId.value = id
-
-    // Fetch incoming session content and populate the workspace.
-    // isDirty must be false after this point — the loaded content is clean.
+    // isSessionLoading drives the "Loading Project..." overlay in
+    // WorkspacePane.vue. Set true for the duration of the switch (including
+    // any autosave of the outgoing session) and reset in finally so a thrown
+    // loadSession does not leave the overlay stuck. Boot-time restore also
+    // routes through this method — showing the overlay during initial
+    // restore is desirable UX, not a regression.
+    isSessionLoading.value = true
     try {
-      const content = await loadSession(id)
-      document.value = content
-      isDirty.value = false
-    } catch (err) {
-      sessionSaveError.value = 'Could not load session content.'
+      // Auto-save outgoing session if there are unsaved changes.
+      if (isDirty.value && activeSessionId.value) {
+        const currentName = sessionList.value.find(s => s.id === activeSessionId.value)?.name
+          ?? 'Session'
+        await saveCurrentSession(currentName)
+      }
+
+      // Set new active session.
+      activeSessionId.value = id
+
+      // Fetch incoming session content and populate the workspace.
+      // isDirty must be false after this point — the loaded content is clean.
+      try {
+        const content = await loadSession(id)
+        document.value = content
+        isDirty.value = false
+      } catch (err) {
+        sessionSaveError.value = 'Could not load session content.'
+      }
+    } finally {
+      isSessionLoading.value = false
     }
   }
 
@@ -834,6 +853,7 @@ export function useSessionIndex({ document }) {
     indexLoadError,
     sessionSaving,
     sessionSaveError,
+    isSessionLoading,
     isDirty,
     setPodRoot,
     loadIndex,
