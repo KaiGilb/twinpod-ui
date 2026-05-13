@@ -50,7 +50,24 @@ import { computed, ref, inject, nextTick } from 'vue'
 export default {
   name: 'SessionPanel',
 
-  emits: ['close'],
+  /*
+   * Events:
+   *   close          — emitted to hide the panel (drawer/sidebar close).
+   *   select-session — emitted every time the user clicks a project list
+   *                    item, regardless of whether it is the currently active
+   *                    one. The parent decides whether to actually switch
+   *                    sessions or just collapse the pane. Payload: the
+   *                    clicked session id (string).
+   *
+   * Rationale (Cycle 033): the previous design called the injected
+   *   switchToSession only when the clicked id differed from
+   *   activeSessionId. That meant re-clicking the currently active project
+   *   gave the parent no signal at all, so the parent could not implement
+   *   "re-click same project closes the side pane". By emitting an
+   *   unconditional select-session, the parent owns the close-vs-switch
+   *   policy.
+   */
+  emits: ['close', 'select-session'],
 
   setup(props, { emit }) {
     // --- Inject shared session state from App.vue ---
@@ -301,8 +318,26 @@ export default {
      * @param {string} id - Session ID to switch to.
      */
     async function onSessionClick(id) {
-      // Guard: already switching, or clicking the active session.
-      if (switchingId.value || id === activeSessionId.value) return
+      // Double-click guard — bail if a switch is already in flight.
+      // We still emit nothing here because the in-flight switch already
+      // committed to a target; a stray re-emit would invite double UI work.
+      if (switchingId.value) return
+
+      // Always tell the parent the user clicked a project list item, even
+      // when it is the currently active one. The parent uses this to close
+      // the side pane on re-click of the active project. Payload: the
+      // clicked session id. See "Events" block at top of component.
+      emit('select-session', id)
+
+      // Same-project re-click: no actual switch needed — useSessionIndex's
+      // switchToSession early-returns on the same id anyway. We still emit
+      // 'close' so the panel collapses (drawer-style usage), and bail
+      // before flipping the loading state.
+      if (id === activeSessionId.value) {
+        emit('close')
+        return
+      }
+
       switchingId.value = id
       try {
         await switchToSession(id)
