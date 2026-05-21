@@ -131,6 +131,52 @@ let _podRoot = ''
 // Reference to the autosave debounce timer — held module-level so it can be cleared.
 let _autosaveTimer = null
 
+// Last-saved snapshot of the document content. Used by the change-aware
+// autosave watcher (Cycle 045 iter-2, 2026-05-21) to distinguish a real user
+// edit from a reactive re-assignment that did not change content (hydration,
+// scroll restoration, session switch). Without this gate the original watcher
+// fired saveCurrentSession on ANY mutation of the document ref — including
+// the load path that hydrates an empty workspace at boot, producing spurious
+// saves and pod write traffic.
+//
+// Initialised to an empty string so the first user keystroke on a clean
+// workspace (whose initial document.value is also '') is correctly detected
+// — the watcher only fires after isDirty flips, which only happens after the
+// content actually differs from '_lastSavedContent'.
+let _lastSavedContent = ''
+
+// Guard A first-edit save timer REMOVED (Cycle 045, 2026-05-21). The watcher
+// it backed caused save-per-keystroke instead of save-per-pause — see the
+// REMOVED comment in setupSessionAutosave for the full reasoning. The
+// change-aware debounce watcher is sufficient on its own; explicit pre-
+// redirect saves go through ensureSessionSaved (Guard B) which awaits
+// saveCurrentSession directly without needing a timer ref.
+
+// localStorage backup key prefix (Guard C — belt-and-suspenders safety net).
+// Every saveCurrentSession call mirrors the workbook content here under
+// the active session id. On app boot, App.vue checks for a more-recent
+// backup than the pod and offers to restore.
+const LOCALSTORAGE_BACKUP_PREFIX = 'theBrain.lastWorkbookDraft.'
+
+// Scratch-draft localStorage key (Emergency hotfix round 2, 2026-05-14).
+//
+// Round 1 (Guards A/B/C) protected users WITH an active session id. The
+// prior emergency missed the actual user case: users land on `/` (no
+// `/project/<slug>`), the shared workbook is rendered as the default
+// landing surface, and `activeSessionId.value === null`. When such a user
+// types into the workbook and then clicks Buy Credits, the Stripe redirect
+// kills the JS context. On return, the module-level `document` ref is
+// freshly initialised to '' — work is lost.
+//
+// This key is independent of session id: it backs up the raw `document`
+// ref content so even when there is no session yet the keystrokes survive
+// a redirect. Boot logic checks for a fresh (<24h) scratch entry when
+// `sessionList` is empty and restores it. Layer 1 (auto-create-session
+// watcher in App.vue) converts the scratch into a real session as soon as
+// the user resumes editing post-restore.
+const SCRATCH_DRAFT_KEY = 'theBrain.scratchDraft.v1'
+const SCRATCH_DRAFT_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
 /**
  * Resets all module-level state to initial values.
  * FOR TESTING ONLY — do not call in production code.
@@ -147,7 +193,163 @@ export function _resetModuleStateForTesting() {
   isDirty.value = false
   _podRoot = ''
   _autosaveTimer = null
+  _lastSavedContent = ''
   _sessionMeta.clear()
+}
+
+// Helper key for localStorage backups (Guard C).
+function _localStorageBackupKey(sessionId) {
+  return LOCALSTORAGE_BACKUP_PREFIX + sessionId
+}
+
+/**
+ * Write a localStorage backup of the workbook content for the given session.
+ * Guard C — belt-and-suspenders safety net so a failed pod save does not
+ * lose the user's keystrokes. Called from every saveCurrentSession attempt
+ * before the network call, so even if the pod write fails the draft persists.
+ *
+ * Safe in non-browser test environments — typeof window guard.
+ *
+ * @param {string} sessionId - Active session id.
+ * @param {string} content - Workbook content to back up.
+ */
+export function _writeLocalStorageBackup(sessionId, content) {
+  if (typeof window === 'undefined' || !window.localStorage) return
+  if (!sessionId) return
+  try {
+    const payload = JSON.stringify({
+      content: content ?? '',
+      savedAt: new Date().toISOString()
+    })
+    window.localStorage.setItem(_localStorageBackupKey(sessionId), payload)
+  } catch {
+    // localStorage may be full or disabled (private mode). Best-effort only.
+  }
+}
+
+/**
+ * Read a localStorage backup for the given session, if present.
+ * Returns null if missing or malformed. Used by App.vue at boot to
+ * detect drafts that did not make it to the pod (e.g. lost via the
+ * Stripe pay-gate redirect race).
+ *
+ * @param {string} sessionId - Session id to look up.
+ * @returns {{ content: string, savedAt: string } | null}
+ */
+export function _readLocalStorageBackup(sessionId) {
+  if (typeof window === 'undefined' || !window.localStorage) return null
+  if (!sessionId) return null
+  try {
+    const raw = window.localStorage.getItem(_localStorageBackupKey(sessionId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (typeof parsed?.content !== 'string') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Remove a localStorage backup for the given session.
+ * Called after a successful pod save so the backup does not grow stale
+ * relative to the canonical pod copy.
+ *
+ * @param {string} sessionId - Session id.
+ */
+export function _clearLocalStorageBackup(sessionId) {
+  if (typeof window === 'undefined' || !window.localStorage) return
+  if (!sessionId) return
+  try {
+    window.localStorage.removeItem(_localStorageBackupKey(sessionId))
+  } catch {
+    // No-op.
+  }
+}
+
+/**
+ * Write the session-agnostic scratch-draft localStorage entry.
+ *
+ * Emergency hotfix round 2 (2026-05-14): protects users WITHOUT an active
+ * session id. Round 1 Guard C is keyed by `sessionId` and is a no-op when
+ * there is no session. This entry exists exactly to cover that gap.
+ *
+ * Empty strings are intentionally NOT written — there is nothing to recover
+ * and a stale empty entry would mask a legitimate non-empty key if the
+ * caller re-orders writes. The boot-time reader treats absence as "no work
+ * to restore" which is the correct UX.
+ *
+ * Safe in non-browser test environments — typeof window guard.
+ *
+ * @param {string} content - Workbook content to back up.
+ */
+export function _writeScratchDraft(content) {
+  if (typeof window === 'undefined' || !window.localStorage) return
+  // Empty content carries no information worth restoring. Skipping the
+  // write also avoids racing with `_clearScratchDraft` after auto-create.
+  if (!content) return
+  try {
+    const payload = JSON.stringify({
+      content,
+      timestamp: new Date().toISOString()
+    })
+    window.localStorage.setItem(SCRATCH_DRAFT_KEY, payload)
+  } catch {
+    // localStorage full / disabled — best-effort only.
+  }
+}
+
+/**
+ * Read the session-agnostic scratch-draft entry, if present and fresh.
+ *
+ * Returns null when:
+ *   - localStorage is unavailable.
+ *   - The key is absent.
+ *   - The stored JSON is malformed.
+ *   - The stored timestamp is older than 24 hours (stale — discard).
+ *
+ * Staleness rule (24h): a redirect that takes longer than a day suggests
+ * the user abandoned the flow; restoring would surprise more than help.
+ * The 24h window covers Stripe Checkout (typically minutes) with slack.
+ *
+ * @returns {{ content: string, timestamp: string } | null}
+ */
+export function _readScratchDraft() {
+  if (typeof window === 'undefined' || !window.localStorage) return null
+  try {
+    const raw = window.localStorage.getItem(SCRATCH_DRAFT_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (typeof parsed?.content !== 'string') return null
+    if (typeof parsed?.timestamp !== 'string') return null
+    if (!parsed.content) return null
+    const ts = new Date(parsed.timestamp).getTime()
+    if (!Number.isFinite(ts)) return null
+    if (Date.now() - ts > SCRATCH_DRAFT_MAX_AGE_MS) {
+      // Stale — discard so it does not shadow legitimate future writes.
+      try { window.localStorage.removeItem(SCRATCH_DRAFT_KEY) } catch { /* no-op */ }
+      return null
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Remove the session-agnostic scratch-draft entry.
+ *
+ * Called when the scratch content has been promoted to a real session
+ * (Layer 1 auto-create path in App.vue) so the session-keyed backup
+ * (Guard C from round 1) takes over.
+ */
+export function _clearScratchDraft() {
+  if (typeof window === 'undefined' || !window.localStorage) return
+  try {
+    window.localStorage.removeItem(SCRATCH_DRAFT_KEY)
+  } catch {
+    // No-op.
+  }
 }
 
 export function useSessionIndex({ document }) {
@@ -352,7 +554,13 @@ export function useSessionIndex({ document }) {
       await saveCurrentSession(currentName)
     }
 
-    const name = 'Project'
+    // Auto-disambiguate the default name by appending a date+time stamp so
+    // two rapid "New Project" clicks don't collide on the slug ('project').
+    // Format: "Project YYYY-MM-DD HH:MM" → slug "project-YYYY-MM-DD-HH-MM".
+    // If a caller later supplies an explicit user-typed name, this default
+    // is replaced via renameSession — only the DEFAULT is timestamped.
+    const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ')
+    const name = `Project ${timestamp}`
     const id = generateSessionId(name)
     const lastModified = new Date().toISOString()
 
@@ -365,6 +573,9 @@ export function useSessionIndex({ document }) {
     // onCreateNewSession in SessionPanel finds the session as soon as this returns.
     activeSessionId.value = id
     document.value = ''
+    // Sync change-aware watcher baseline so the watcher does NOT treat this
+    // programmatic clear as a user edit (Cycle 045 iter-2 change-aware autosave).
+    _lastSavedContent = ''
 
     await saveIndex()
   }
@@ -415,6 +626,12 @@ export function useSessionIndex({ document }) {
     // same block id. Future plugins that add/insert blocks should generate ids via
     // UUID v4 (or another collision-resistant scheme); the spec only requires stability
     // per block, not a specific format.
+    // Guard C (Emergency 2026-05-14) — write a localStorage backup of the
+    // workbook content BEFORE attempting the pod save. If the pod write
+    // fails for any reason (network, auth, pay-gate redirect cancelling
+    // the in-flight request) the draft is still recoverable at next boot.
+    _writeLocalStorageBackup(id, document.value ?? '')
+
     const blockId = `${id}-block-1`
     const sessionDoc = {
       schemaVersion: DOC_SCHEMA_VERSION,
@@ -434,6 +651,31 @@ export function useSessionIndex({ document }) {
     }
     const body = JSON.stringify(sessionDoc)
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Cycle 045 (iter-2, 2026-05-21) — bare-file PUT with transparent versioning.
+    //
+    // Per Kai's correction: session files are bare resources, not entity-bound
+    // attributes. They have no parent entity holding a State pointer (e.g. a
+    // schema:contentUrl predicate via Stack B PATCH), so the canonical 5-step
+    // entity-update lifecycle (STATE_LIFECYCLE_01) does NOT apply to this save:
+    //   - There is no rdfStore-tracked predicate whose old State must be deleted.
+    //   - The file URL is stable (`{id}.json`) across saves, so TwinPod's
+    //     transparent versioning (Reference_Code_TwinPod-EntityUpdateLifecycle
+    //     Pattern 5) creates a new server-side version on each PUT to the same
+    //     filename. No client-side State management is required.
+    //
+    // The previous Cycle 045 iter-1 implementation minted a Neo entity via
+    // ur.createNeoNode and PATCHed a schema:contentUrl pointer via Stack B on
+    // every save. That was over-engineered: the entity pointer URL never
+    // changes (filename is stable), so re-PATCHing on every save is a no-op
+    // that adds latency, log noise, and a failure mode.
+    //
+    // Net save path is one network call: a PUT of the JSON body. If empirical
+    // testing later shows bare files DO need a parent-entity State pointer
+    // (e.g. for cross-pod discovery or ACL), reintroduce the entity mint as a
+    // one-time first-save step — not on every save.
+    // ──────────────────────────────────────────────────────────────────────────
+
     try {
       const fileResponse = await ur.uploadFile(sessionFileUrl, body, 'application/json')
       if (!fileResponse.ok) {
@@ -447,12 +689,27 @@ export function useSessionIndex({ document }) {
       // skip the .md fallback once the new .json exists.
       _sessionMeta.set(id, { created, legacyLoaded: false })
 
-      // Update the index entry.
+      // Update the index entry (name + lastModified). entityURI is no longer
+      // persisted — bare files don't need a parent-entity pointer.
       sessionList.value = sessionList.value.map(s =>
-        s.id === id ? { ...s, name, lastModified: nowIso } : s
+        s.id === id
+          ? { ...s, name, lastModified: nowIso }
+          : s
       )
 
       await saveIndex()
+
+      // Remember what was saved so the change-aware autosave watcher can skip
+      // reactive re-assignments that don't actually change content. Set BEFORE
+      // clearing the local backup so a watcher-driven follow-up save sees the
+      // up-to-date snapshot.
+      _lastSavedContent = document.value ?? ''
+
+      // Successful pod save — clear the localStorage backup so it does not
+      // shadow future legitimate pod state (e.g. content edited on another
+      // device). The backup is only valuable while it represents unsaved-
+      // to-pod work.
+      _clearLocalStorageBackup(id)
     } catch (err) {
       // Network failure — restore isDirty.
       isDirty.value = true
@@ -607,6 +864,9 @@ export function useSessionIndex({ document }) {
       try {
         const content = await loadSession(id)
         document.value = content
+        // Sync change-aware watcher baseline so the load is not mistaken for a
+        // user edit (Cycle 045 iter-2 change-aware autosave).
+        _lastSavedContent = content ?? ''
         isDirty.value = false
       } catch (err) {
         sessionSaveError.value = 'Could not load session content.'
@@ -746,15 +1006,19 @@ export function useSessionIndex({ document }) {
         try {
           const content = await loadSession(mostRecent.id)
           document.value = content
+          // Sync change-aware watcher baseline (Cycle 045 iter-2).
+          _lastSavedContent = content ?? ''
           isDirty.value = false
         } catch {
           document.value = ''
+          _lastSavedContent = ''
           isDirty.value = false
         }
       } else {
         // No sessions left — clear workspace entirely.
         activeSessionId.value = null
         document.value = ''
+        _lastSavedContent = ''
         isDirty.value = false
       }
     }
@@ -797,9 +1061,28 @@ export function useSessionIndex({ document }) {
    * Spec: 3P.F.SessionSave autosave trigger.
    */
   function setupSessionAutosave(debouncedMs = 180000) {
-    watch(document, () => {
-      // { immediate: false } is not needed on watch — the watcher only fires on change.
-      // isDirty is set true here; saveCurrentSession will reset it before saving.
+    // Change-aware watcher (Cycle 045 iter-2, 2026-05-21).
+    //
+    // Per Kai's correction: the previous unconditional watcher fired on ANY
+    // mutation of the document ref — including hydration (loadSession sets
+    // document.value), scroll-restore, and other reactive re-assignments
+    // that did NOT represent a user edit. That produced spurious autosaves
+    // on every load.
+    //
+    // Fix: only consider a mutation a "real edit" if the new content differs
+    // from the last-saved snapshot (_lastSavedContent). This still catches
+    // Tom-bot writes (those genuinely change content) but ignores no-op
+    // re-assignments. Watching `document` itself is preserved so the user's
+    // own keystrokes still trigger the autosave path.
+    watch(document, (newDoc) => {
+      const current = newDoc ?? ''
+      if (current === _lastSavedContent) {
+        // No real change — reactive re-assignment (load, hydration, etc.).
+        // Do not flip isDirty, do not schedule a save.
+        return
+      }
+      // Real content change — set isDirty so saveCurrentSession can reset it
+      // before the write, and arm the debounce timer.
       isDirty.value = true
 
       clearTimeout(_autosaveTimer)
@@ -810,6 +1093,25 @@ export function useSessionIndex({ document }) {
         saveCurrentSession(name)
       }, debouncedMs)
     }, { immediate: false })
+
+    // Guard A REMOVED (Cycle 045, 2026-05-21) — save-on-first-edit watcher.
+    //
+    // The previous watch(isDirty, …) that fired saveCurrentSession on every
+    // false→true transition of isDirty caused save-per-keystroke instead of
+    // save-per-pause: saveCurrentSession resets isDirty to false before the
+    // network write (see line ~604), so the very next keystroke flipped
+    // isDirty false→true again and re-armed Guard A's 1s timer. With three
+    // characters typed quickly, the result was 3× project-<id>.json PUT +
+    // 3× index.json PUT in the network tab instead of the expected 1+1
+    // after the change-aware debounce window.
+    //
+    // The change-aware debounce watcher above (watch(document, …)) is the
+    // sole autosave trigger now: each keystroke clearTimeout()s the prior
+    // _autosaveTimer and setTimeout()s a new one, so the save fires ONCE
+    // after the user pauses for `debouncedMs`. Explicit saves (Save button,
+    // session switch, ensureSessionSaved before redirect) remain unaffected
+    // — they call saveCurrentSession / saveActiveSession directly and do
+    // not depend on this watcher.
   }
 
   // --- Explicit save helper ---
@@ -827,6 +1129,101 @@ export function useSessionIndex({ document }) {
     const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
       ?? 'Session'
     await saveCurrentSession(name)
+  }
+
+  /**
+   * Guard B (Emergency 2026-05-14) — pre-redirect save with timeout.
+   *
+   * Awaits an in-flight saveCurrentSession before an external navigation
+   * (Stripe Checkout, OIDC, logout). When the pod is slow, a hard timeout
+   * lets the redirect proceed so the user's payment intent is not blocked
+   * — the localStorage backup (Guard C) still preserves their work.
+   *
+   * Does not block when isDirty is false (nothing to save).
+   *
+   * @param {number} [timeoutMs=3000] - Max wait before yielding to the redirect.
+   * @returns {Promise<boolean>} true on completed save or clean state; false on timeout/error.
+   */
+  async function ensureSessionSaved(timeoutMs = 3000) {
+    if (!isDirty.value) return true
+    if (!activeSessionId.value || !_podRoot) return true
+    const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
+      ?? 'Session'
+    try {
+      await Promise.race([
+        saveCurrentSession(name),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('save timeout')), timeoutMs)
+        )
+      ])
+      return true
+    } catch (e) {
+      // Log but do NOT throw — caller will redirect anyway. The localStorage
+      // backup written inside saveCurrentSession (Guard C) is the safety net.
+      console.warn('[emergency-save] save before redirect failed', e)
+      return false
+    }
+  }
+
+  /**
+   * Guard C-boot (Emergency 2026-05-14) — restore localStorage draft if newer.
+   *
+   * After loadSession populates the workspace from the pod, this helper
+   * compares the pod-loaded content with any localStorage backup for the
+   * same session id. If a backup exists AND its content differs from the
+   * pod-loaded content, the backup is treated as the more-recent draft
+   * (we cleared on every successful pod save, so any surviving backup
+   * represents work that did NOT make it to the pod).
+   *
+   * On restore: writes the backup content into the document ref and
+   * marks the session as dirty so the autosave triggers a fresh pod
+   * save. Returns true when a restore happened so App.vue can show a
+   * one-time toast.
+   *
+   * @param {string} sessionId - The active session id to check.
+   * @returns {boolean} true when a draft was restored, false otherwise.
+   */
+  function restoreLocalStorageDraftIfNewer(sessionId) {
+    if (!sessionId) return false
+    const backup = _readLocalStorageBackup(sessionId)
+    if (!backup) return false
+    const podContent = document.value ?? ''
+    if (backup.content === podContent) {
+      // Pod is up to date — no restore needed.
+      _clearLocalStorageBackup(sessionId)
+      return false
+    }
+    // Backup differs from pod — restore it. The watch in setupSessionAutosave
+    // will set isDirty=true and the new first-edit save (Guard A) will push
+    // the restored content back to the pod within ~1s.
+    document.value = backup.content
+    return true
+  }
+
+  /**
+   * Layer 2 boot restore (Emergency r2, 2026-05-14) — no-session scratch.
+   *
+   * Called by App.vue after `loadIndex()` resolves AND `sessionList` is
+   * still empty (no sessions yet for this user). If a fresh (<24h)
+   * scratch-draft entry exists in localStorage, restore its content into
+   * `document` so the user does not lose work captured before a session
+   * ever existed (the Buy-Credits-from-empty-workbook case).
+   *
+   * The Layer 1 auto-create watcher in App.vue will pick this up on the
+   * user's next keystroke and promote the scratch into a real session;
+   * we do NOT auto-create a session here so that returning users see
+   * exactly the content they typed, with no surprise URL change.
+   *
+   * @returns {boolean} true when content was restored, false otherwise.
+   */
+  function restoreScratchDraftIfFresh() {
+    const scratch = _readScratchDraft()
+    if (!scratch) return false
+    // Only restore when the workspace is empty — otherwise we would
+    // shadow legitimately-loaded content from a different code path.
+    if (document.value) return false
+    document.value = scratch.content
+    return true
   }
 
   // --- Pod root capture ---
@@ -866,6 +1263,10 @@ export function useSessionIndex({ document }) {
     renameSession,
     renameSessionProject,
     deleteSession,
-    setupSessionAutosave
+    setupSessionAutosave,
+    // Emergency hotfix 2026-05-14 — data-loss defense-in-depth helpers.
+    ensureSessionSaved,
+    restoreLocalStorageDraftIfNewer,
+    restoreScratchDraftIfFresh
   }
 }
