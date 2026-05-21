@@ -66,7 +66,10 @@ const FREE_CREDIT_WEBIDS = [
   'https://tommy.gilb.com/i',
   'https://tst-heppa.demo.systemtwin.com/i',
   'https://tst-testertom.demo.systemtwin.com/i',
-  'https://tst-planner.demo.systemtwin.com/i'
+  'https://tst-planner.demo.systemtwin.com/i',
+  // 2026-05-19 (Cycle 048): added tst-plannereu (twinpod.eu) — Kai's twinpod.eu
+  // test user, for browser-testing the Evo book viewer deep-link bug.
+  'https://tst-plannereu.twinpod.eu/i'
 ]
 const FREE_CREDIT_AMOUNT = 100000
 
@@ -200,7 +203,47 @@ export function useCreditLedger() {
         // ledgers treated as false/null so existing users are not affected.
         trialUsed.value = data.trialUsed ?? false
         trialStartedAt.value = data.trialStartedAt ?? null
-        console.info('[useCreditLedger] loadCredits — existing ledger loaded, balance:', balance.value)
+
+        // Spec: Evo9.WebIDFreeCredit (recovery / grant-on-top branch) — if a
+        // whitelisted WebID has an existing ledger AND no prior `grant` entry,
+        // apply the 100K grant idempotently. Adds 100K on top of whatever balance
+        // already exists (e.g. Tommy paid 500 → ends up with 100,500). Guarded by
+        // the "no prior grant" check so it can never re-grant.
+        // Restored 2026-05-19 (Cycle 048 hotfix) — accidentally removed in a57e01f
+        // during diagnostic cleanup; original landed in d9cec13.
+        const hasPriorGrant = (ledger.value || []).some(e => e?.type === 'grant')
+        if (webId && FREE_CREDIT_WEBIDS.includes(webId) && !hasPriorGrant) {
+          const now = new Date().toISOString()
+          const newBalance = (balance.value || 0) + FREE_CREDIT_AMOUNT
+          const grantedLedger = {
+            ...data,
+            balance: newBalance,
+            ledger: [...(data.ledger || []), { type: 'grant', credits: FREE_CREDIT_AMOUNT, reason: 'whitelist', ts: now }],
+            updatedAt: now
+          }
+          balance.value = newBalance
+          ledger.value = grantedLedger.ledger
+          console.info('[useCreditLedger] whitelist grant applied — webId:', webId, 'balance set to:', newBalance)
+          try {
+            await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+            const putRes = await fetcher(ledgerUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(grantedLedger, null, 2)
+            })
+            if (putRes && putRes.ok === false) {
+              console.warn('[useCreditLedger] whitelist grant-on-top PUT non-OK:', putRes.status)
+            } else {
+              console.info('[useCreditLedger] whitelist grant-on-top PUT ok')
+            }
+          } catch (writeErr) {
+            // Non-fatal — balance is already set reactively; pod write is best-effort
+            console.warn('[useCreditLedger] Whitelist grant-on-top pod write failed (non-fatal):', writeErr)
+          }
+        } else {
+          console.info('[useCreditLedger] loadCredits — existing ledger loaded, balance:', balance.value)
+        }
       } else if (response.ok || response.status === 404) {
         // First-time user — pod has no ledger yet. Either the pod returned 404
         // (legacy / non-TwinPod servers) or 200 with fabricated metadata
