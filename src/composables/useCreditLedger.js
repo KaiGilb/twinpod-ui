@@ -227,7 +227,11 @@ export function useCreditLedger() {
           try {
             await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
             await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
-            const putRes = await ur.uploadFile(ledgerUrl, JSON.stringify(grantedLedger, null, 2), 'application/json')
+            const putRes = await fetcher(ledgerUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(grantedLedger, null, 2)
+            })
             if (putRes && putRes.ok === false) {
               console.warn('[useCreditLedger] whitelist grant-on-top PUT non-OK:', putRes.status)
             } else {
@@ -267,7 +271,11 @@ export function useCreditLedger() {
           try {
             await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
             await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
-            const putRes = await ur.uploadFile(ledgerUrl, JSON.stringify(initialLedger, null, 2), 'application/json')
+            const putRes = await fetcher(ledgerUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(initialLedger, null, 2)
+            })
             if (putRes && putRes.ok === false) {
               console.warn('[useCreditLedger] whitelist grant PUT non-OK:', putRes.status)
             } else {
@@ -465,11 +473,15 @@ export function useCreditLedger() {
         await ensureContainer(_podRoot + '/apps/', authenticatedFetch, { slug: 'apps', label: 'Apps' })
         await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
 
-        // Write updated ledger to pod via bare-file PUT (TwinPod single-namespace rule)
-        const putRes = await ur.uploadFile(ledgerUrl, JSON.stringify(currentLedger, null, 2), 'application/json')
+        // Write updated ledger to pod using DPoP-authenticated session.fetch
+        const putRes = await authenticatedFetch(ledgerUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(currentLedger, null, 2)
+        })
 
         if (!putRes.ok) {
-          const body = await (putRes.text ? putRes.text().catch(() => '') : Promise.resolve(''))
+          const body = await putRes.text().catch(() => '')
           console.error('[useCreditLedger] PUT ledger failed:', putRes.status, body)
           error.value = `Could not save credit balance (${putRes.status})`
           return
@@ -618,7 +630,11 @@ export function useCreditLedger() {
       await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
 
       const updated = { ...existing, trialUsed: true, trialStartedAt: ts, updatedAt: new Date().toISOString() }
-      const putRes = await ur.uploadFile(ledgerUrl, JSON.stringify(updated, null, 2), 'application/json')
+      const putRes = await authenticatedFetch(ledgerUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated, null, 2)
+      })
       if (!putRes.ok) {
         console.warn('[useCreditLedger] writeTrialStart PUT failed (non-fatal):', putRes.status)
       }
@@ -703,7 +719,11 @@ export function useCreditLedger() {
         updatedAt: new Date().toISOString()
       }
 
-      const putRes = await ur.uploadFile(ledgerUrl, JSON.stringify(updated, null, 2), 'application/json')
+      const putRes = await authenticatedFetch(ledgerUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated, null, 2)
+      })
       if (!putRes.ok) {
         console.warn('[useCreditLedger] decrementCredit PUT failed (non-fatal):', putRes.status)
       }

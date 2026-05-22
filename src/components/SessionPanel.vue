@@ -644,51 +644,6 @@ export default {
         </div>
 
         <!--
-          Project label row.
-          Spec: 3P.V.SessionProjectChangeability — ≤ 2 user actions to change project label.
-          Action 1: double-click on label (or pencil icon click). Action 2: Enter to confirm.
-        -->
-        <div class="session-panel__project-row">
-          <template v-if="renamingProjectId !== session.id">
-            <button
-              class="session-panel__project-btn"
-              :aria-label="`Project: ${session.project || 'The Brain'}`"
-              @dblclick.stop="activateProjectRename(session)"
-            >
-              <span class="session-panel__project-text">{{ session.project || 'The Brain' }}</span>
-            </button>
-            <button
-              class="session-panel__rename-btn session-panel__rename-btn--project"
-              :aria-label="`Rename project label for: ${session.name}`"
-              @click.stop="activateProjectRename(session)"
-            >
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true" focusable="false">
-                <path d="M9.5 1.5l2 2L4 11H2v-2L9.5 1.5z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/>
-              </svg>
-            </button>
-          </template>
-          <template v-else>
-            <label :for="`project-input-${session.id}`" class="sr-only">Project label</label>
-            <input
-              :id="`project-input-${session.id}`"
-              v-model="renameProjectValue"
-              class="session-panel__rename-input session-panel__rename-input--project"
-              type="text"
-              placeholder="Project label…"
-              :aria-describedby="renameProjectError ? `project-error-${session.id}` : undefined"
-              @keydown="onProjectInputKeydown($event, session.id)"
-              @blur="confirmProjectRename(session.id)"
-            />
-            <span
-              v-if="renameProjectError"
-              :id="`project-error-${session.id}`"
-              class="session-panel__input-error"
-              role="alert"
-            >{{ renameProjectError }}</span>
-          </template>
-        </div>
-
-        <!--
           Delete confirmation strip — shown when the trash icon is clicked.
           Spec: 3P.F.SessionDelete — two-step delete (arm → confirm) prevents accidental deletion.
           role="alert" announces the confirmation to screen readers.

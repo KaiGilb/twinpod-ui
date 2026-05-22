@@ -578,11 +578,6 @@ export function useSessionIndex({ document }) {
     _lastSavedContent = ''
 
     await saveIndex()
-    // Write the initial session .json file immediately so the pod has a real
-    // resource at the session URL from the moment of creation (bare-file PUT,
-    // no parent entity pointer needed — see Reference_Code_TwinPod-BareFileSave).
-    // document.value is '' at this point, producing an empty-block session doc.
-    await saveCurrentSession(name)
   }
 
   /**
