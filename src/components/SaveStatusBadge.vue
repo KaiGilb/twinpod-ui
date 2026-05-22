@@ -9,24 +9,48 @@
 
   Visual states (in priority order):
     1. ANY failed job → persistent red toast with Retry + Dismiss buttons.
-       Failed jobs stay visible until the user acts.
+       Failed jobs stay visible until the user acts. (Shown when showErrors)
     2. ANY running job → blue "Saving…" pill with spinner. Auto-dismisses
-       when the queue drains.
+       when the queue drains. (Shown when showSaving)
     3. ANY just-succeeded job → green "Saved ✓" pill, auto-fades after
-       SUCCESS_TTL_MS (2.5s) — defined in useBackgroundSave.
+       SUCCESS_TTL_MS (2.5s) defined in useBackgroundSave. (Shown when showSuccess)
     4. Idle → nothing rendered.
+
+  Props (all default true — opt out per app for the silent-save UX):
+    showSaving  Show the blue "Saving…" pill while any save is running.
+    showSuccess Show the green "Saved ✓" pill after a successful save.
+    showErrors  Show persistent red error toasts on save failure.
+
+  Common configurations:
+    Full feedback (default):
+        <SaveStatusBadge />
+    Silent on success, visible on failure (recommended for inline-edit apps):
+        <SaveStatusBadge :show-saving="false" :show-success="false" />
+    Fully silent (errors only logged to console):
+        omit the component entirely.
 
   Accessibility:
     aria-live="polite" on the wrapper so screen-readers announce changes
     without interrupting other content. The error block is role="alert"
     so failures are announced immediately.
-
-  No props, no emits. Pure consumer of the composable.
 -->
 <script setup>
+import { computed } from 'vue'
 import { useBackgroundSave } from '../composables/useBackgroundSave.js'
 
+const props = defineProps({
+  showSaving:  { type: Boolean, default: true },
+  showSuccess: { type: Boolean, default: true },
+  showErrors:  { type: Boolean, default: true },
+})
+
 const { anySaving, succeeded, failed, retry, dismiss } = useBackgroundSave()
+
+// Gated views of the queue state — each visual block reads the gated copy so
+// the template logic stays declarative.
+const showSavingPill  = computed(() => props.showSaving  && anySaving.value)
+const showSuccessPill = computed(() => props.showSuccess && succeeded.value.length > 0)
+const visibleFailed   = computed(() => props.showErrors  ? failed.value : [])
 </script>
 
 <template>
@@ -34,7 +58,7 @@ const { anySaving, succeeded, failed, retry, dismiss } = useBackgroundSave()
     <div class="tpu-save-status" aria-live="polite">
       <!-- Failed toasts (persistent — one per failed job) -->
       <transition-group name="tpu-save-fade" tag="div" class="tpu-save-status__failed">
-        <div v-for="job in failed" :key="job.id" class="tpu-save-status__error" role="alert">
+        <div v-for="job in visibleFailed" :key="job.id" class="tpu-save-status__error" role="alert">
           <span class="tpu-save-status__icon" aria-hidden="true">⚠</span>
           <span class="tpu-save-status__text">
             Save failed<template v-if="job.label !== 'save'">: {{ job.label }}</template>
@@ -46,11 +70,11 @@ const { anySaving, succeeded, failed, retry, dismiss } = useBackgroundSave()
 
       <!-- Single Saving / Saved pill (mutually exclusive) -->
       <transition name="tpu-save-fade">
-        <div v-if="anySaving" class="tpu-save-status__pill tpu-save-status__pill--running">
+        <div v-if="showSavingPill" class="tpu-save-status__pill tpu-save-status__pill--running">
           <span class="tpu-save-status__spinner" aria-hidden="true"></span>
           <span>Saving…</span>
         </div>
-        <div v-else-if="succeeded.length" class="tpu-save-status__pill tpu-save-status__pill--success">
+        <div v-else-if="showSuccessPill" class="tpu-save-status__pill tpu-save-status__pill--success">
           <span aria-hidden="true">✓</span>
           <span>Saved</span>
         </div>
