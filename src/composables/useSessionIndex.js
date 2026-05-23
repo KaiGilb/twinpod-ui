@@ -66,6 +66,8 @@
  */
 
 import { ref, watch } from 'vue'
+// ur namespace import below also wires ur.enqueueSave / ur.onSaveEvent via
+// twinpod-client's main entry (src/index.js side-effect-imports save-queue.js).
 import { ur } from '@kaigilb/twinpod-client'
 
 // --- Single configurable constant for sessions storage root ---
@@ -898,53 +900,14 @@ export function useSessionIndex({ document }) {
     // Persist updated index.
     await saveIndex()
 
-    // Also update the session file if it exists.
-    // Best-effort: try the new {id}.json first (typed-JSON-document shape). If that
-    // is not present, fall back to legacy {id}.md (JSON-in-.md shape). If neither
-    // exists yet, no-op — the new name is already in index.json and the session file
-    // will be written on the next saveCurrentSession() in the new shape.
-    const jsonUrl = sessionsRoot() + '/' + id + '.json'
-    const jsonResponse = await ur.hyperFetch(jsonUrl, {
-      method: 'GET',
-      headers: { accept: 'application/json' }
-    })
-
-    if (jsonResponse.ok) {
-      const existingText = await jsonResponse.text()
-      try {
-        const existing = JSON.parse(existingText)
-        if (typeof existing?.schemaVersion === 'number' && Array.isArray(existing?.blocks)) {
-          existing.name = trimmed
-          existing.lastModified = new Date().toISOString()
-          await ur.uploadFile(jsonUrl, JSON.stringify(existing), 'application/json')
-          return
-        }
-      } catch {
-        // Shape mismatch — fall through to legacy .md try.
-      }
-    }
-
-    // Legacy fallback — only attempted if no .json exists. We rewrite the legacy
-    // session_name in place so old clients keep seeing the new name; subsequent
-    // saveCurrentSession() will write the new .json shape and supersede this.
-    const mdUrl = sessionsRoot() + '/' + id + '.md'
-    const mdResponse = await ur.hyperFetch(mdUrl, {
-      method: 'GET',
-      headers: { accept: 'application/json' }
-    })
-
-    if (mdResponse.ok) {
-      const existingText = await mdResponse.text()
-      try {
-        const existing = JSON.parse(existingText)
-        existing.session_name = trimmed
-        await ur.uploadFile(mdUrl, JSON.stringify(existing), 'application/json')
-      } catch {
-        // text+frontmatter or unexpected — leave file alone. index.json carries the
-        // authoritative name; next saveCurrentSession() writes the new .json shape.
-      }
-    }
-    // 404 on both = file not yet saved; name will be written on next saveCurrentSession().
+    // Path 9 DROPPED (Cycle 046, 2026-05-23) — rename no longer GETs +
+    // re-PUTs the session body to update its embedded `name` field. The
+    // body's `session_name` becomes stale until the next autosave writes
+    // it, which is acceptable: the panel shows the index entry's `name`
+    // (authoritative), not the body's. Dropping the in-band body PATCH
+    // removes the "rename drops in-flight edits" failure mode (rename
+    // racing against a queued autosave of the body would clobber the
+    // in-flight content).
   }
 
   /**
@@ -1061,19 +1024,17 @@ export function useSessionIndex({ document }) {
    * Spec: 3P.F.SessionSave autosave trigger.
    */
   function setupSessionAutosave(debouncedMs = 180000) {
-    // Change-aware watcher (Cycle 045 iter-2, 2026-05-21).
+    // Change-aware watcher (Cycle 045 iter-2, 2026-05-21; updated Cycle 046
+    // 2026-05-23 to route saves through the canonical background-save queue
+    // per Reference_Code_TwinPod-OptimisticSaveQueue).
     //
-    // Per Kai's correction: the previous unconditional watcher fired on ANY
-    // mutation of the document ref — including hydration (loadSession sets
-    // document.value), scroll-restore, and other reactive re-assignments
-    // that did NOT represent a user edit. That produced spurious autosaves
-    // on every load.
-    //
-    // Fix: only consider a mutation a "real edit" if the new content differs
-    // from the last-saved snapshot (_lastSavedContent). This still catches
-    // Tom-bot writes (those genuinely change content) but ignores no-op
-    // re-assignments. Watching `document` itself is preserved so the user's
-    // own keystrokes still trigger the autosave path.
+    // The watcher gates on content equality (suppresses hydration / scroll-
+    // restore re-assignments) and on debounce. When the debounce fires it
+    // hands off to enqueueWorkbookSave, which enqueues via ur.enqueueSave
+    // (FIFO-per-resourceKey). The queue is responsible for serialising
+    // concurrent saves and surfacing status via useBackgroundSave /
+    // <SaveStatusBadge />. The watcher does NOT call saveCurrentSession
+    // directly any more — see enqueueWorkbookSave below.
     watch(document, (newDoc) => {
       const current = newDoc ?? ''
       if (current === _lastSavedContent) {
@@ -1087,10 +1048,11 @@ export function useSessionIndex({ document }) {
 
       clearTimeout(_autosaveTimer)
       _autosaveTimer = setTimeout(() => {
+        _autosaveTimer = null
         if (!isDirty.value || !activeSessionId.value) return
         const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
           ?? 'Session'
-        saveCurrentSession(name)
+        enqueueWorkbookSave(name)
       }, debouncedMs)
     }, { immediate: false })
 
@@ -1131,35 +1093,175 @@ export function useSessionIndex({ document }) {
     await saveCurrentSession(name)
   }
 
+  // --- Canonical background-save entry points (Cycle 046, 2026-05-23) ---
+  //
+  // enqueueWorkbookSave + flushPendingSaves are the canonical entry points
+  // for ALL workbook saves. They route through the background-save queue
+  // (ur.enqueueSave) per Reference_Code_TwinPod-OptimisticSaveQueue —
+  // serialised FIFO per resourceKey (the session JSON URL), with status
+  // surfaced via useBackgroundSave + <SaveStatusBadge />.
+  //
+  // Existing callers (saveActiveSession, ensureSessionSaved, callers that
+  // call saveCurrentSession directly) are wrapped to go through the queue
+  // so all save paths share the same serialisation guarantee — no two
+  // saves of the same session can race the 5-step lifecycle even in a
+  // pathological click-storm.
+  //
+  // Trigger reduction (Cycle 046): the previous 11+ trigger paths
+  // collapse to 3 canonical triggers (per Kai's 5-point design):
+  //   1. Debounced typing — setupSessionAutosave watcher (above) ends in
+  //      enqueueWorkbookSave on debounce fire.
+  //   2. Lifecycle gate — beforeunload / switchToSession / createNewSession /
+  //      wrappedLogout / wrappedStartCheckout call flushPendingSaves(timeoutMs).
+  //      beforeunload uses timeoutMs=0 (snapshot to localStorage; no await).
+  //   3. Explicit Save / workspace-pane click delegate → flushPendingSaves().
+
+  /**
+   * Canonical workbook-save entry point. Enqueues a save of the active
+   * session through the background-save queue (ur.enqueueSave) and returns
+   * the job id (or null when there is nothing to save). Synchronous return
+   * — the actual write happens in the queue.
+   *
+   * The job's resourceKey is the session JSON URL. Saves of the same
+   * session serialise FIFO; saves of different sessions can run in
+   * parallel (which is fine — they target different resources).
+   *
+   * Guard C — the localStorage backup is written synchronously BEFORE the
+   * queue enqueue, so even if the browser dies before the queue drains the
+   * work is recoverable at next boot.
+   *
+   * @param {string} [name] - Session name to persist. Defaults to current
+   *                          name from sessionList.
+   * @returns {string | null} The queue job id, or null when no active session.
+   */
+  function enqueueWorkbookSave(name) {
+    if (!_podRoot || !activeSessionId.value) return null
+    const id = activeSessionId.value
+    const sessionName = name
+      ?? sessionList.value.find(s => s.id === id)?.name
+      ?? 'Session'
+    // Guard C — synchronous localStorage backup BEFORE enqueue. Survives
+    // browser close even if the queued task never runs. saveCurrentSession
+    // will also re-write the backup right before the network call, but
+    // doing it here makes the close-while-queued window safe too.
+    _writeLocalStorageBackup(id, document.value ?? '')
+    const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+    return ur.enqueueSave({
+      resourceKey: sessionFileUrl,
+      label: 'workbook-save',
+      task: () => saveCurrentSession(sessionName)
+    })
+  }
+
+  /**
+   * Flush any pending debounce + await queue drain for the active session.
+   * Canonical entry point for lifecycle gates (beforeunload, switchToSession,
+   * createNewSession, wrappedLogout, wrappedStartCheckout, explicit Save
+   * button, workspace-pane click delegate).
+   *
+   * Semantics:
+   *   - Cancels any pending autosave debounce timer.
+   *   - If document content differs from last-saved snapshot, enqueues a
+   *     save synchronously (so beforeunload-snapshot work is captured in
+   *     the localStorage backup even when timeoutMs=0).
+   *   - Awaits queue drain for the active session up to timeoutMs.
+   *   - timeoutMs=0 returns immediately AFTER the synchronous backup +
+   *     enqueue — DO NOT await. This is the beforeunload contract: the
+   *     browser will cancel in-flight fetches on unload anyway, so the
+   *     localStorage backup (Guard C) is the recovery path.
+   *
+   * @param {number} [timeoutMs=3000] - Max ms to wait for the queue to drain
+   *                                    after enqueueing the (optional) save.
+   *                                    0 = synchronous-snapshot only.
+   * @returns {Promise<boolean>} true on clean drain (or no-op), false on timeout.
+   */
+  async function flushPendingSaves(timeoutMs = 3000) {
+    // 1. Cancel any pending debounce — about to flush.
+    if (_autosaveTimer) {
+      clearTimeout(_autosaveTimer)
+      _autosaveTimer = null
+    }
+    // 2. Nothing to do when there is no active session / no podRoot.
+    if (!_podRoot || !activeSessionId.value) return true
+    // 3. Enqueue a save only when content actually differs from the last
+    //    saved snapshot (avoids spurious PUTs on lifecycle transitions
+    //    when the user did nothing). The dirty-flag is a hint that
+    //    historically over-fired (see Guard A REMOVED comment); the
+    //    content-comparison is the authoritative truth.
+    const current = document.value ?? ''
+    const needsSave = current !== _lastSavedContent
+    let jobId = null
+    if (needsSave) {
+      jobId = enqueueWorkbookSave()
+    }
+    // 4. timeoutMs=0 — synchronous-snapshot mode (beforeunload). Backup
+    //    was written inside enqueueWorkbookSave; queue task will run if
+    //    the JS context survives long enough, otherwise localStorage is
+    //    the recovery path. Return immediately without awaiting.
+    if (timeoutMs === 0) return true
+    // 5. Await drain. If we enqueued, wait for THIS job's terminal event.
+    //    If we did NOT enqueue (no-op flush) but a prior autosave is in
+    //    flight, watch for any in-flight task on our resourceKey and wait
+    //    for its terminal event. Otherwise resolve immediately.
+    const sessionFileUrl = sessionsRoot() + '/' + activeSessionId.value + '.json'
+    return await new Promise((resolve) => {
+      let settled = false
+      let watchedJobId = jobId
+      const overallTimer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        unsubscribe()
+        resolve(false)
+      }, timeoutMs)
+      const settleWith = (ok) => {
+        if (settled) return
+        settled = true
+        clearTimeout(overallTimer)
+        unsubscribe()
+        resolve(ok)
+      }
+      const unsubscribe = ur.onSaveEvent((evt) => {
+        // Only events for our session resource matter.
+        if (evt.resourceKey !== sessionFileUrl) return
+        // If we did not enqueue and a prior autosave is still in flight,
+        // adopt its id and wait for its terminal event.
+        if (!watchedJobId && (evt.type === 'queued' || evt.type === 'started')) {
+          watchedJobId = evt.id
+          return
+        }
+        if (watchedJobId && evt.id === watchedJobId) {
+          if (evt.type === 'succeeded') return settleWith(true)
+          if (evt.type === 'failed') return settleWith(false)
+        }
+      })
+      // No enqueue + no prior task expected: short-circuit immediately so
+      // callers do not wait for the overallTimer on a clean state.
+      if (!jobId) {
+        // Yield a microtask so any in-flight `queued`/`started` for the
+        // same key (e.g. enqueued moments before from another path) can
+        // be observed before we settle clean.
+        queueMicrotask(() => {
+          if (!watchedJobId) settleWith(true)
+        })
+      }
+    })
+  }
+
   /**
    * Guard B (Emergency 2026-05-14) — pre-redirect save with timeout.
    *
-   * Awaits an in-flight saveCurrentSession before an external navigation
-   * (Stripe Checkout, OIDC, logout). When the pod is slow, a hard timeout
-   * lets the redirect proceed so the user's payment intent is not blocked
-   * — the localStorage backup (Guard C) still preserves their work.
-   *
-   * Does not block when isDirty is false (nothing to save).
+   * Compatibility shim (Cycle 046, 2026-05-23) — delegates to
+   * flushPendingSaves which is the canonical lifecycle-gate entry point.
+   * Existing App.vue callers (wrappedLogout / wrappedStartCheckout) keep
+   * working unchanged.
    *
    * @param {number} [timeoutMs=3000] - Max wait before yielding to the redirect.
    * @returns {Promise<boolean>} true on completed save or clean state; false on timeout/error.
    */
   async function ensureSessionSaved(timeoutMs = 3000) {
-    if (!isDirty.value) return true
-    if (!activeSessionId.value || !_podRoot) return true
-    const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-      ?? 'Session'
     try {
-      await Promise.race([
-        saveCurrentSession(name),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('save timeout')), timeoutMs)
-        )
-      ])
-      return true
+      return await flushPendingSaves(timeoutMs)
     } catch (e) {
-      // Log but do NOT throw — caller will redirect anyway. The localStorage
-      // backup written inside saveCurrentSession (Guard C) is the safety net.
       console.warn('[emergency-save] save before redirect failed', e)
       return false
     }
@@ -1267,6 +1369,9 @@ export function useSessionIndex({ document }) {
     // Emergency hotfix 2026-05-14 — data-loss defense-in-depth helpers.
     ensureSessionSaved,
     restoreLocalStorageDraftIfNewer,
-    restoreScratchDraftIfFresh
+    restoreScratchDraftIfFresh,
+    // Canonical background-save entry points (Cycle 046, 2026-05-23).
+    enqueueWorkbookSave,
+    flushPendingSaves
   }
 }
