@@ -550,10 +550,10 @@ export function useSessionIndex({ document }) {
    */
   async function createNewSession() {
     // Auto-save outgoing session if there are unsaved changes — mirrors switchToSession.
+    // Cycle 046: route through flushPendingSaves so the save runs through the queue
+    // (serialised against any in-flight autosave on the outgoing session).
     if (isDirty.value && activeSessionId.value) {
-      const currentName = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-        ?? 'Session'
-      await saveCurrentSession(currentName)
+      await flushPendingSaves(3000)
     }
 
     // Auto-disambiguate the default name by appending a date+time stamp so
@@ -852,10 +852,10 @@ export function useSessionIndex({ document }) {
     isSessionLoading.value = true
     try {
       // Auto-save outgoing session if there are unsaved changes.
+      // Cycle 046: route through flushPendingSaves so the save runs through
+      // the canonical queue (serialised against any in-flight autosave).
       if (isDirty.value && activeSessionId.value) {
-        const currentName = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-          ?? 'Session'
-        await saveCurrentSession(currentName)
+        await flushPendingSaves(3000)
       }
 
       // Set new active session.
