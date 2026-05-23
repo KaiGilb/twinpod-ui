@@ -614,6 +614,17 @@ export function useSessionIndex({ document }) {
     // remains as a historical artifact on the pod per spec "Old .md filename handling".
     const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
 
+    // Rename-race fix (Cycle 047, 2026-05-23): resolve `name` from sessionList
+    // at PUT-time rather than trusting the `name` parameter captured at enqueue
+    // time. The background-save queue can hold a `saveCurrentSession("Old Name")`
+    // task that was enqueued before a renameSession() call updated sessionList;
+    // if we used the stale parameter, the body file AND the post-success
+    // sessionList .map below would both overwrite the user's new name with
+    // the old one (the "rename pops back" bug — Hypothesis 5 in the brief).
+    // sessionList is the authoritative source for `name` — renameSession writes
+    // it, saveCurrentSession reads it. The parameter is only a fallback for the
+    // unlikely case where the entry was removed between enqueue and PUT.
+    const resolvedName = sessionList.value.find(s => s.id === id)?.name ?? name
     const project = sessionList.value.find(s => s.id === id)?.project ?? 'The Brain'
     const nowIso = new Date().toISOString()
     // Preserve created timestamp across saves (in-memory meta map). For sessions that
@@ -638,7 +649,7 @@ export function useSessionIndex({ document }) {
     const sessionDoc = {
       schemaVersion: DOC_SCHEMA_VERSION,
       id,
-      name,
+      name: resolvedName,
       project,
       created,
       lastModified: nowIso,
@@ -691,11 +702,15 @@ export function useSessionIndex({ document }) {
       // skip the .md fallback once the new .json exists.
       _sessionMeta.set(id, { created, legacyLoaded: false })
 
-      // Update the index entry (name + lastModified). entityURI is no longer
-      // persisted — bare files don't need a parent-entity pointer.
+      // Update the index entry — lastModified only. `name` is owned by
+      // renameSession (the index entry IS the authoritative name source); we
+      // must NOT overwrite it here, or a saveCurrentSession enqueued before a
+      // rename would clobber the new name when its PUT resolves (Cycle 047
+      // rename-race fix). entityURI is no longer persisted — bare files don't
+      // need a parent-entity pointer.
       sessionList.value = sessionList.value.map(s =>
         s.id === id
-          ? { ...s, name, lastModified: nowIso }
+          ? { ...s, lastModified: nowIso }
           : s
       )
 
