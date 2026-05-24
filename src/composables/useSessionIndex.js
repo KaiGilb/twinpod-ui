@@ -860,7 +860,7 @@ export function useSessionIndex({ document }) {
    * @returns {Promise<void>}
    */
   async function switchToSession(id) {
-    if (!id || id === activeSessionId.value) return
+    if (!id || id === activeSessionId.value) return { restored: false }
 
     // isSessionLoading drives the "Loading Project..." overlay in
     // WorkspacePane.vue. Set true for the duration of the switch (including
@@ -869,6 +869,7 @@ export function useSessionIndex({ document }) {
     // routes through this method — showing the overlay during initial
     // restore is desirable UX, not a regression.
     isSessionLoading.value = true
+    let restored = false
     try {
       // Auto-save outgoing session if there are unsaved changes.
       // Cycle 046: route through flushPendingSaves so the save runs through
@@ -889,12 +890,62 @@ export function useSessionIndex({ document }) {
         // user edit (Cycle 045 iter-2 change-aware autosave).
         _lastSavedContent = content ?? ''
         isDirty.value = false
+
+        // ──────────────────────────────────────────────────────────────────
+        // Guard C boot-restore (Cycle 048, 2026-05-24) — MUST run here, NOT
+        // from an external watcher.
+        //
+        // Bug history: prior implementation called restoreLocalStorageDraftIfNewer
+        // from an App.vue `watch(activeSessionId, ...)` with nextTick scheduling.
+        // The race:
+        //   1. activeSessionId.value = id  → watcher queues nextTick(restore).
+        //   2. await loadSession(id)       → microtasks drain → nextTick fires
+        //      → restore reads document.value (still empty!) → restores backup.
+        //   3. loadSession resolves        → `document.value = content` CLOBBERS
+        //      the restore.
+        //   4. setupSessionAutosave runs LATER (App.vue) → watcher missed the
+        //      whole exchange, nothing schedules a save.
+        // Net: offline edits silently lost across browser close.
+        //
+        // Fix: run restore HERE, after `document.value = content` has settled
+        // the pod content and `_lastSavedContent` is the pod baseline. If the
+        // localStorage backup differs from the pod, restore wins and we
+        // synchronously enqueue a save so the pod catches up the moment the
+        // network is back — no dependency on the autosave watcher being
+        // installed at the right time, no dependency on the user typing again.
+        if (restoreLocalStorageDraftIfNewer(id)) {
+          restored = true
+          // Surface as dirty so any explicit save callers see the right
+          // state; setupSessionAutosave's watcher (when present) will also
+          // observe the document mutation made by the restore and arm its
+          // debounce — but we don't rely on it.
+          isDirty.value = true
+          // Enqueue the save NOW. Resource-key serialisation in the queue
+          // means if a subsequent autosave enqueues, they run FIFO against
+          // the same key, no race. If offline, the task fails per existing
+          // semantics (backup retained, isDirty=true).
+          if (_podRoot) {
+            const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+            const sessionName = sessionList.value.find(s => s.id === id)?.name
+              ?? 'Session'
+            // _writeLocalStorageBackup is already current (the restore just
+            // wrote then read it; saveCurrentSession will re-write before
+            // PUT and clear on success).
+            ur.enqueueSave({
+              resourceKey: sessionFileUrl,
+              label: 'workbook-save-after-restore',
+              task: () => saveCurrentSession(sessionName)
+            })
+          }
+        }
+        // ──────────────────────────────────────────────────────────────────
       } catch (err) {
         sessionSaveError.value = 'Could not load session content.'
       }
     } finally {
       isSessionLoading.value = false
     }
+    return { restored }
   }
 
   // --- Rename helpers ---
