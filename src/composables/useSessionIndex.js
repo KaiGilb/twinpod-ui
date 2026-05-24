@@ -109,6 +109,11 @@ const indexLoading = ref(false)
 const indexLoadError = ref(null)
 const sessionSaving = ref(false)
 const sessionSaveError = ref(null)
+// Non-blocking error surface for delete failures (BareFileSave 2026-05-23).
+// Previously deleteSession swallowed all errors silently; we now route through
+// ur.deleteURI and surface failures here so the UI / telemetry can see them
+// without blocking the optimistic list removal.
+const sessionDeleteError = ref(null)
 
 // isSessionLoading drives the "Loading Project..." overlay in
 // WorkspacePane.vue. Set true while switchToSession() is in flight
@@ -191,6 +196,7 @@ export function _resetModuleStateForTesting() {
   indexLoadError.value = null
   sessionSaving.value = false
   sessionSaveError.value = null
+  sessionDeleteError.value = null
   isSessionLoading.value = false
   isDirty.value = false
   _podRoot = ''
@@ -381,25 +387,23 @@ export function useSessionIndex({ document }) {
   /**
    * Ensures the sessions container exists on the pod using an LDP BasicContainer PUT.
    * Idempotent — 409 (already exists) is treated as success.
-   * Uses the same pattern as Cycle 12 (usePodWorkbook.js container creation).
+   *
+   * Cycle-046 (BareFileSave 2026-05-23): delegates to the canonical
+   * ur.ensureContainer primitive in @kaigilb/twinpod-client. The previous
+   * inline HEAD-less PUT was one of three near-duplicate copies across the
+   * codebase; promoting the primitive removed the duplication and restores
+   * the HEAD-probe (avoids unnecessary PUTs on every load).
+   *
    * @returns {Promise<void>}
    */
   async function ensureSessionsContainer() {
     // /home/ exists by default on TwinPod, so we only need to ensure the leaf container.
-    // PUT is idempotent (409 = already exists). The TwinPodData container at /apps/TomTwin/
-    // is ensured by useCreditLedger / useUserFactStore — not our concern here.
-    const containerUrl = sessionsRoot() + '/'
-    await ur.hyperFetch(containerUrl, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'text/turtle',
-        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
-      },
-      // rdfs:label gives the container a human-readable name in the pod browser.
-      body: '@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "TomTwinProjects" .\n'
+    // The TwinPodData container at /apps/TomTwin/ is ensured by useCreditLedger /
+    // useUserFactStore — not our concern here.
+    await ur.ensureContainer(sessionsRoot() + '/', {
+      slug: 'TomTwinProjects',
+      label: 'TomTwinProjects'
     })
-    // 409 = already exists — acceptable; response status not checked here because
-    // the file PUT immediately after will surface real auth/network failures.
   }
 
   // --- Session ID generation ---
@@ -1009,17 +1013,28 @@ export function useSessionIndex({ document }) {
     // that may still exist for sessions created before the typed-JSON-document
     // format). 404 / 405 / network errors on either are acceptable — the index has
     // already been updated and is the authoritative session list.
+    //
+    // BareFileSave 2026-05-23: switched from raw ur.hyperFetch DELETE (which left
+    // local rdfStore stale and silently swallowed all errors) to ur.deleteURI —
+    // canonical primitive that DELETEs on the server AND prunes both directions
+    // of rdfStore (`(*, *, uri)` and `(uri, *, *)`). Failures emit a console.warn
+    // and surface on sessionDeleteError (non-blocking) per the brief.
     const jsonUrl = sessionsRoot() + '/' + id + '.json'
     const mdUrl = sessionsRoot() + '/' + id + '.md'
+    sessionDeleteError.value = null
     try {
-      await ur.hyperFetch(jsonUrl, { method: 'DELETE' })
-    } catch {
-      // ignore
+      const okJson = await ur.deleteURI(jsonUrl)
+      if (!okJson) console.warn('[useSessionIndex] deleteURI returned false for', jsonUrl)
+    } catch (err) {
+      console.warn('[useSessionIndex] deleteURI threw for', jsonUrl, err?.message || err)
+      sessionDeleteError.value = `Could not delete session file (${err?.message || 'unknown error'})`
     }
     try {
-      await ur.hyperFetch(mdUrl, { method: 'DELETE' })
-    } catch {
-      // ignore
+      // ur.deleteURI returns false for 404, which is the expected case for sessions
+      // that never had a .md companion file. Don't warn on that.
+      await ur.deleteURI(mdUrl)
+    } catch (err) {
+      console.warn('[useSessionIndex] deleteURI threw for legacy', mdUrl, err?.message || err)
     }
   }
 
@@ -1367,6 +1382,7 @@ export function useSessionIndex({ document }) {
     indexLoadError,
     sessionSaving,
     sessionSaveError,
+    sessionDeleteError,
     isSessionLoading,
     isDirty,
     setPodRoot,
