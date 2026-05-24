@@ -54,6 +54,100 @@ import { ref } from 'vue'
 import { ur } from '@kaigilb/twinpod-client'
 import { isRealTwinPodResource } from './util/twinpod-resource-exists.js'
 
+// BareFileSave 2026-05-23 — Group 5 (HIGHEST STAKES).
+//
+// All four ledger write paths (whitelist grant, applyPendingCredits,
+// writeTrialStart, decrementCredit) now route through ur.enqueueSave with
+// the SAME resourceKey (the ledger URL) so the queue FIFO-serialises them.
+// This eliminates the four-way race the historical defensive comments
+// (positive-balance guard, GET-prove-zero gate, processedEvents dedupe)
+// mitigated; we KEEP those guards as defense-in-depth — they cost nothing
+// and protect against any path that ever bypasses the queue in future.
+//
+// Guard C: synchronous localStorage backup at theBrain.creditLedgerBackup
+// BEFORE every enqueue, cleared on confirmed pod success. Money paths
+// MUST survive browser close.
+//
+// Single-namespace migration: PUTs go through ur.uploadJSON, reads through
+// ur.readJSON, container ensure through ur.ensureContainer — restores
+// compliance with vacoder.md by eliminating the authenticatedFetch bypass
+// that Cycle-15 introduced because of hyperFetch's RDF Accept headers.
+const CREDIT_LEDGER_BACKUP_KEY = 'theBrain.creditLedgerBackup'
+
+function _writeLedgerBackup(snapshot) {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(CREDIT_LEDGER_BACKUP_KEY, JSON.stringify({
+        ledger: snapshot,
+        savedAt: new Date().toISOString()
+      }))
+    }
+  } catch { /* localStorage full/disabled — best-effort */ }
+}
+function _clearLedgerBackup() {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem(CREDIT_LEDGER_BACKUP_KEY)
+    }
+  } catch { /* no-op */ }
+}
+
+/**
+ * Read a ledger from the pod via ur.readJSON. Falls back to the
+ * authenticatedFetch path when a caller passes one explicitly — this is
+ * only used by tests that drive a custom mock fetch. Production paths
+ * leave authenticatedFetch undefined and use ur.readJSON.
+ *
+ * Returns the raw response shape the existing read code expects
+ * ({ ok, status, headers, json }) so the isRealTwinPodResource shape-check
+ * downstream is unchanged.
+ */
+async function _readLedger(url, authenticatedFetch) {
+  if (authenticatedFetch) {
+    return await authenticatedFetch(url, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' }
+    })
+  }
+  const r = await ur.readJSON(url)
+  // Synthesise a fetch-Response-like envelope around ur.readJSON's result so
+  // isRealTwinPodResource (which expects response.headers.get) keeps working.
+  return {
+    ok: r.ok,
+    status: r.status,
+    headers: { get: () => null }, // ur.readJSON doesn't expose headers; shape-check still works
+    json: async () => r.value
+  }
+}
+
+/**
+ * Wrap a "build payload + PUT" lambda in the canonical queue. Returns a
+ * promise that resolves on succeeded / rejects on failed terminal events.
+ *
+ * All four ledger write paths funnel through this so they share:
+ *   - resourceKey (FIFO-serialisation per ledger URL),
+ *   - Guard C backup BEFORE enqueue,
+ *   - backup clear on success.
+ */
+function _enqueueLedgerWrite({ resourceKey, label, snapshot, task }) {
+  // Guard C — money path must survive browser close.
+  _writeLedgerBackup(snapshot)
+  return new Promise((resolve, reject) => {
+    const jobId = ur.enqueueSave({ resourceKey, label, task })
+    const unsub = ur.onSaveEvent((evt) => {
+      if (evt.id !== jobId) return
+      if (evt.type === 'succeeded') {
+        _clearLedgerBackup()
+        unsub()
+        resolve(evt.result)
+      } else if (evt.type === 'failed') {
+        unsub()
+        reject(evt.error)
+      }
+    })
+  })
+}
+
 // Spec: Evo9.WebIDFreeCredit — whitelisted WebIDs receive a one-time 100K credit grant
 // on first login (no existing pod ledger). They appear as normal credit holders to the
 // gate, meter, and telemetry — usage is tracked, not bypassed.
@@ -224,22 +318,33 @@ export function useCreditLedger() {
           balance.value = newBalance
           ledger.value = grantedLedger.ledger
           console.info('[useCreditLedger] whitelist grant applied — webId:', webId, 'balance set to:', newBalance)
+          // Route through the queue (BareFileSave Group 5). This is a read-
+          // triggered write — the read returns before the queued PUT
+          // completes, which is intentional: callers don't await loadCredits's
+          // write step. Sharing resourceKey with later decrementCredit /
+          // applyPendingCredits ensures any of those queued just after will
+          // see this grant landed before they try to read-modify-write.
           try {
             await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
             await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
-            const putRes = await fetcher(ledgerUrl, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(grantedLedger, null, 2)
+            await _enqueueLedgerWrite({
+              resourceKey: ledgerUrl,
+              label: 'creditLedger-whitelistGrant',
+              snapshot: grantedLedger,
+              task: async () => {
+                const putRes = await ur.uploadJSON(ledgerUrl, JSON.stringify(grantedLedger, null, 2))
+                if (!putRes || putRes.ok === false) {
+                  console.warn('[useCreditLedger] whitelist grant-on-top PUT non-OK:', putRes?.status)
+                  const e = new Error(`whitelist grant PUT failed (${putRes?.status || 0})`)
+                  throw e
+                }
+                console.info('[useCreditLedger] whitelist grant-on-top PUT ok')
+                return { ok: true }
+              }
             })
-            if (putRes && putRes.ok === false) {
-              console.warn('[useCreditLedger] whitelist grant-on-top PUT non-OK:', putRes.status)
-            } else {
-              console.info('[useCreditLedger] whitelist grant-on-top PUT ok')
-            }
           } catch (writeErr) {
             // Non-fatal — balance is already set reactively; pod write is best-effort
-            console.warn('[useCreditLedger] Whitelist grant-on-top pod write failed (non-fatal):', writeErr)
+            console.warn('[useCreditLedger] Whitelist grant-on-top pod write failed (non-fatal):', writeErr?.message || writeErr)
           }
         } else {
           console.info('[useCreditLedger] loadCredits — existing ledger loaded, balance:', balance.value)
@@ -267,23 +372,28 @@ export function useCreditLedger() {
           // Cycle 19 follow-up #5: whitelist branch matched.
           console.info('[useCreditLedger] whitelist grant applied — webId:', webId, 'balance set to:', FREE_CREDIT_AMOUNT)
 
-          // Write the initial ledger to the pod so subsequent logins load it normally
+          // Write the initial ledger to the pod so subsequent logins load it normally.
+          // Routed through the queue — same resourceKey as the other three paths.
           try {
             await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
             await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
-            const putRes = await fetcher(ledgerUrl, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(initialLedger, null, 2)
+            await _enqueueLedgerWrite({
+              resourceKey: ledgerUrl,
+              label: 'creditLedger-whitelistInitial',
+              snapshot: initialLedger,
+              task: async () => {
+                const putRes = await ur.uploadJSON(ledgerUrl, JSON.stringify(initialLedger, null, 2))
+                if (!putRes || putRes.ok === false) {
+                  console.warn('[useCreditLedger] whitelist grant PUT non-OK:', putRes?.status)
+                  throw new Error(`whitelist grant PUT failed (${putRes?.status || 0})`)
+                }
+                console.info('[useCreditLedger] whitelist grant PUT ok')
+                return { ok: true }
+              }
             })
-            if (putRes && putRes.ok === false) {
-              console.warn('[useCreditLedger] whitelist grant PUT non-OK:', putRes.status)
-            } else {
-              console.info('[useCreditLedger] whitelist grant PUT ok')
-            }
           } catch (writeErr) {
             // Non-fatal — balance is already set reactively; pod write is best-effort
-            console.warn('[useCreditLedger] Whitelist grant pod write failed (non-fatal):', writeErr)
+            console.warn('[useCreditLedger] Whitelist grant pod write failed (non-fatal):', writeErr?.message || writeErr)
           }
         } else {
           // Non-whitelisted first-time user — use defaults (free trial flow)
@@ -473,21 +583,30 @@ export function useCreditLedger() {
         await ensureContainer(_podRoot + '/apps/', authenticatedFetch, { slug: 'apps', label: 'Apps' })
         await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
 
-        // Write updated ledger to pod using DPoP-authenticated session.fetch
-        const putRes = await authenticatedFetch(ledgerUrl, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(currentLedger, null, 2)
-        })
-
-        if (!putRes.ok) {
-          const body = await putRes.text().catch(() => '')
-          console.error('[useCreditLedger] PUT ledger failed:', putRes.status, body)
-          error.value = `Could not save credit balance (${putRes.status})`
+        // Route through the queue (BareFileSave Group 5 — same resourceKey as
+        // the other three paths so all four FIFO-serialise).
+        try {
+          await _enqueueLedgerWrite({
+            resourceKey: ledgerUrl,
+            label: 'creditLedger-applyPendingCredits',
+            snapshot: currentLedger,
+            task: async () => {
+              const putRes = await ur.uploadJSON(ledgerUrl, JSON.stringify(currentLedger, null, 2))
+              if (!putRes || !putRes.ok) {
+                const errMsg = `PUT ledger failed: ${putRes?.status || 0}`
+                console.error('[useCreditLedger]', errMsg)
+                const e = new Error(errMsg)
+                e.status = putRes?.status || 0
+                throw e
+              }
+              return { ok: true }
+            }
+          })
+          console.log('[useCreditLedger] Pending credits applied — new balance:', currentLedger.balance)
+        } catch (e) {
+          error.value = `Could not save credit balance (${e?.status || 0})`
           return
         }
-
-        console.log('[useCreditLedger] Pending credits applied — new balance:', currentLedger.balance)
       }
 
       // Always update reactive state to reflect current ledger
@@ -630,17 +749,29 @@ export function useCreditLedger() {
       await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
 
       const updated = { ...existing, trialUsed: true, trialStartedAt: ts, updatedAt: new Date().toISOString() }
-      const putRes = await authenticatedFetch(ledgerUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updated, null, 2)
+      // Route through the queue (BareFileSave Group 5 — shared resourceKey).
+      await _enqueueLedgerWrite({
+        resourceKey: ledgerUrl,
+        label: 'creditLedger-writeTrialStart',
+        snapshot: updated,
+        task: async () => {
+          const putRes = await ur.uploadJSON(ledgerUrl, JSON.stringify(updated, null, 2))
+          if (!putRes || !putRes.ok) {
+            console.warn('[useCreditLedger] writeTrialStart PUT failed (non-fatal):', putRes?.status)
+            // Don't throw — UI gates already display via reactive refs; this
+            // is best-effort. But we still mark the queue task as failed so
+            // the backup is NOT cleared (the failure surface stays).
+            throw new Error(`writeTrialStart PUT failed (${putRes?.status || 0})`)
+          }
+          return { ok: true }
+        }
+      }).catch((err) => {
+        // Match the legacy "non-fatal" contract — log, do not propagate.
+        console.warn('[useCreditLedger] writeTrialStart queue task failed (non-fatal):', err?.message)
       })
-      if (!putRes.ok) {
-        console.warn('[useCreditLedger] writeTrialStart PUT failed (non-fatal):', putRes.status)
-      }
     } catch (err) {
       // Non-fatal — trial is active in KV; pod write is best-effort
-      console.warn('[useCreditLedger] writeTrialStart error (non-fatal):', err.message)
+      console.warn('[useCreditLedger] writeTrialStart error (non-fatal):', err?.message || err)
     }
   }
 
@@ -719,17 +850,26 @@ export function useCreditLedger() {
         updatedAt: new Date().toISOString()
       }
 
-      const putRes = await authenticatedFetch(ledgerUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updated, null, 2)
+      // Route through the queue (BareFileSave Group 5 — shared resourceKey).
+      await _enqueueLedgerWrite({
+        resourceKey: ledgerUrl,
+        label: 'creditLedger-decrementCredit',
+        snapshot: updated,
+        task: async () => {
+          const putRes = await ur.uploadJSON(ledgerUrl, JSON.stringify(updated, null, 2))
+          if (!putRes || !putRes.ok) {
+            console.warn('[useCreditLedger] decrementCredit PUT failed (non-fatal):', putRes?.status)
+            throw new Error(`decrementCredit PUT failed (${putRes?.status || 0})`)
+          }
+          return { ok: true }
+        }
+      }).catch((err) => {
+        // Match the legacy "non-fatal" contract.
+        console.warn('[useCreditLedger] decrementCredit queue task failed (non-fatal):', err?.message)
       })
-      if (!putRes.ok) {
-        console.warn('[useCreditLedger] decrementCredit PUT failed (non-fatal):', putRes.status)
-      }
     } catch (err) {
       // Non-fatal — optimistic decrement already applied; pod write is best-effort
-      console.warn('[useCreditLedger] decrementCredit error (non-fatal):', err.message)
+      console.warn('[useCreditLedger] decrementCredit error (non-fatal):', err?.message || err)
     }
   }
 

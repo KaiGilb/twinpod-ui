@@ -66,6 +66,8 @@
  */
 
 import { ref, watch } from 'vue'
+// ur namespace import below also wires ur.enqueueSave / ur.onSaveEvent via
+// twinpod-client's main entry (src/index.js side-effect-imports save-queue.js).
 import { ur } from '@kaigilb/twinpod-client'
 
 // --- Single configurable constant for sessions storage root ---
@@ -107,6 +109,11 @@ const indexLoading = ref(false)
 const indexLoadError = ref(null)
 const sessionSaving = ref(false)
 const sessionSaveError = ref(null)
+// Non-blocking error surface for delete failures (BareFileSave 2026-05-23).
+// Previously deleteSession swallowed all errors silently; we now route through
+// ur.deleteURI and surface failures here so the UI / telemetry can see them
+// without blocking the optimistic list removal.
+const sessionDeleteError = ref(null)
 
 // isSessionLoading drives the "Loading Project..." overlay in
 // WorkspacePane.vue. Set true while switchToSession() is in flight
@@ -189,6 +196,7 @@ export function _resetModuleStateForTesting() {
   indexLoadError.value = null
   sessionSaving.value = false
   sessionSaveError.value = null
+  sessionDeleteError.value = null
   isSessionLoading.value = false
   isDirty.value = false
   _podRoot = ''
@@ -379,25 +387,23 @@ export function useSessionIndex({ document }) {
   /**
    * Ensures the sessions container exists on the pod using an LDP BasicContainer PUT.
    * Idempotent — 409 (already exists) is treated as success.
-   * Uses the same pattern as Cycle 12 (usePodWorkbook.js container creation).
+   *
+   * Cycle-046 (BareFileSave 2026-05-23): delegates to the canonical
+   * ur.ensureContainer primitive in @kaigilb/twinpod-client. The previous
+   * inline HEAD-less PUT was one of three near-duplicate copies across the
+   * codebase; promoting the primitive removed the duplication and restores
+   * the HEAD-probe (avoids unnecessary PUTs on every load).
+   *
    * @returns {Promise<void>}
    */
   async function ensureSessionsContainer() {
     // /home/ exists by default on TwinPod, so we only need to ensure the leaf container.
-    // PUT is idempotent (409 = already exists). The TwinPodData container at /apps/TomTwin/
-    // is ensured by useCreditLedger / useUserFactStore — not our concern here.
-    const containerUrl = sessionsRoot() + '/'
-    await ur.hyperFetch(containerUrl, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'text/turtle',
-        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
-      },
-      // rdfs:label gives the container a human-readable name in the pod browser.
-      body: '@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "TomTwinProjects" .\n'
+    // The TwinPodData container at /apps/TomTwin/ is ensured by useCreditLedger /
+    // useUserFactStore — not our concern here.
+    await ur.ensureContainer(sessionsRoot() + '/', {
+      slug: 'TomTwinProjects',
+      label: 'TomTwinProjects'
     })
-    // 409 = already exists — acceptable; response status not checked here because
-    // the file PUT immediately after will surface real auth/network failures.
   }
 
   // --- Session ID generation ---
@@ -474,8 +480,25 @@ export function useSessionIndex({ document }) {
     try {
       // Read the canonical (new) index first.
       const primary = await fetchIndex(sessionsRoot())
-      // Then read the legacy index (read-only, for migrating users with pre-rename data).
-      const legacy = await fetchIndex(legacySessionsRoot())
+
+      // Cycle 048 fix (2026-05-24) — eliminate the per-login legacy `index.json`
+      // 404 (or wasted round-trip) for migrated users by only reading the legacy
+      // path when the primary returned nothing. After a user has triggered any
+      // saveIndex() post-rename, the primary contains the full merged list
+      // (including formerly-legacy entries) and a second legacy fetch only
+      // produces network noise (a 404 in the most common case, since the
+      // legacy `index.json` is never deleted but is never re-written either —
+      // it stays as a historical artefact). The merge semantics ("primary wins
+      // on id collision") become a no-op the moment primary holds the full set.
+      //
+      // Pre-migration users (primary genuinely empty/404) still get the legacy
+      // fallback so their existing data surfaces unchanged. Eager write-up of
+      // legacy into primary is deferred — landing it here would introduce a
+      // pod write on every cold load for the duration of the migration, which
+      // is a separate decision from the network-noise fix.
+      const legacy = primary.entries === null
+        ? await fetchIndex(legacySessionsRoot())
+        : { entries: null, status: 0 }
 
       // Merge: new index entries win on id collision (a re-saved legacy session has
       // moved into the new index and should not appear twice).
@@ -491,8 +514,11 @@ export function useSessionIndex({ document }) {
         }
       }
 
-      // Both sources missing AND both responded non-404 → treat as a real error.
-      // Otherwise: 404 on either is just "first use" or "no legacy data" — fine.
+      // Both sources missing AND primary responded with a real error (5xx,
+      // network failure) → surface as a load error. Otherwise: 404 on either
+      // is just "first use" or "no legacy data" — fine. (The legacy fetch is
+      // only consulted when primary === null, so a legacy real-error need
+      // not be checked separately — primary already supplied null.)
       const primaryReal = primary.status !== 0 && primary.status !== 404
       const legacyReal = legacy.status !== 0 && legacy.status !== 404
       if (
@@ -548,10 +574,10 @@ export function useSessionIndex({ document }) {
    */
   async function createNewSession() {
     // Auto-save outgoing session if there are unsaved changes — mirrors switchToSession.
+    // Cycle 046: route through flushPendingSaves so the save runs through the queue
+    // (serialised against any in-flight autosave on the outgoing session).
     if (isDirty.value && activeSessionId.value) {
-      const currentName = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-        ?? 'Session'
-      await saveCurrentSession(currentName)
+      await flushPendingSaves(3000)
     }
 
     // Auto-disambiguate the default name by appending a date+time stamp so
@@ -612,6 +638,17 @@ export function useSessionIndex({ document }) {
     // remains as a historical artifact on the pod per spec "Old .md filename handling".
     const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
 
+    // Rename-race fix (Cycle 047, 2026-05-23): resolve `name` from sessionList
+    // at PUT-time rather than trusting the `name` parameter captured at enqueue
+    // time. The background-save queue can hold a `saveCurrentSession("Old Name")`
+    // task that was enqueued before a renameSession() call updated sessionList;
+    // if we used the stale parameter, the body file AND the post-success
+    // sessionList .map below would both overwrite the user's new name with
+    // the old one (the "rename pops back" bug — Hypothesis 5 in the brief).
+    // sessionList is the authoritative source for `name` — renameSession writes
+    // it, saveCurrentSession reads it. The parameter is only a fallback for the
+    // unlikely case where the entry was removed between enqueue and PUT.
+    const resolvedName = sessionList.value.find(s => s.id === id)?.name ?? name
     const project = sessionList.value.find(s => s.id === id)?.project ?? 'The Brain'
     const nowIso = new Date().toISOString()
     // Preserve created timestamp across saves (in-memory meta map). For sessions that
@@ -636,7 +673,7 @@ export function useSessionIndex({ document }) {
     const sessionDoc = {
       schemaVersion: DOC_SCHEMA_VERSION,
       id,
-      name,
+      name: resolvedName,
       project,
       created,
       lastModified: nowIso,
@@ -689,11 +726,15 @@ export function useSessionIndex({ document }) {
       // skip the .md fallback once the new .json exists.
       _sessionMeta.set(id, { created, legacyLoaded: false })
 
-      // Update the index entry (name + lastModified). entityURI is no longer
-      // persisted — bare files don't need a parent-entity pointer.
+      // Update the index entry — lastModified only. `name` is owned by
+      // renameSession (the index entry IS the authoritative name source); we
+      // must NOT overwrite it here, or a saveCurrentSession enqueued before a
+      // rename would clobber the new name when its PUT resolves (Cycle 047
+      // rename-race fix). entityURI is no longer persisted — bare files don't
+      // need a parent-entity pointer.
       sessionList.value = sessionList.value.map(s =>
         s.id === id
-          ? { ...s, name, lastModified: nowIso }
+          ? { ...s, lastModified: nowIso }
           : s
       )
 
@@ -839,7 +880,7 @@ export function useSessionIndex({ document }) {
    * @returns {Promise<void>}
    */
   async function switchToSession(id) {
-    if (!id || id === activeSessionId.value) return
+    if (!id || id === activeSessionId.value) return { restored: false }
 
     // isSessionLoading drives the "Loading Project..." overlay in
     // WorkspacePane.vue. Set true for the duration of the switch (including
@@ -848,12 +889,13 @@ export function useSessionIndex({ document }) {
     // routes through this method — showing the overlay during initial
     // restore is desirable UX, not a regression.
     isSessionLoading.value = true
+    let restored = false
     try {
       // Auto-save outgoing session if there are unsaved changes.
+      // Cycle 046: route through flushPendingSaves so the save runs through
+      // the canonical queue (serialised against any in-flight autosave).
       if (isDirty.value && activeSessionId.value) {
-        const currentName = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-          ?? 'Session'
-        await saveCurrentSession(currentName)
+        await flushPendingSaves(3000)
       }
 
       // Set new active session.
@@ -868,12 +910,62 @@ export function useSessionIndex({ document }) {
         // user edit (Cycle 045 iter-2 change-aware autosave).
         _lastSavedContent = content ?? ''
         isDirty.value = false
+
+        // ──────────────────────────────────────────────────────────────────
+        // Guard C boot-restore (Cycle 048, 2026-05-24) — MUST run here, NOT
+        // from an external watcher.
+        //
+        // Bug history: prior implementation called restoreLocalStorageDraftIfNewer
+        // from an App.vue `watch(activeSessionId, ...)` with nextTick scheduling.
+        // The race:
+        //   1. activeSessionId.value = id  → watcher queues nextTick(restore).
+        //   2. await loadSession(id)       → microtasks drain → nextTick fires
+        //      → restore reads document.value (still empty!) → restores backup.
+        //   3. loadSession resolves        → `document.value = content` CLOBBERS
+        //      the restore.
+        //   4. setupSessionAutosave runs LATER (App.vue) → watcher missed the
+        //      whole exchange, nothing schedules a save.
+        // Net: offline edits silently lost across browser close.
+        //
+        // Fix: run restore HERE, after `document.value = content` has settled
+        // the pod content and `_lastSavedContent` is the pod baseline. If the
+        // localStorage backup differs from the pod, restore wins and we
+        // synchronously enqueue a save so the pod catches up the moment the
+        // network is back — no dependency on the autosave watcher being
+        // installed at the right time, no dependency on the user typing again.
+        if (restoreLocalStorageDraftIfNewer(id)) {
+          restored = true
+          // Surface as dirty so any explicit save callers see the right
+          // state; setupSessionAutosave's watcher (when present) will also
+          // observe the document mutation made by the restore and arm its
+          // debounce — but we don't rely on it.
+          isDirty.value = true
+          // Enqueue the save NOW. Resource-key serialisation in the queue
+          // means if a subsequent autosave enqueues, they run FIFO against
+          // the same key, no race. If offline, the task fails per existing
+          // semantics (backup retained, isDirty=true).
+          if (_podRoot) {
+            const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+            const sessionName = sessionList.value.find(s => s.id === id)?.name
+              ?? 'Session'
+            // _writeLocalStorageBackup is already current (the restore just
+            // wrote then read it; saveCurrentSession will re-write before
+            // PUT and clear on success).
+            ur.enqueueSave({
+              resourceKey: sessionFileUrl,
+              label: 'workbook-save-after-restore',
+              task: () => saveCurrentSession(sessionName)
+            })
+          }
+        }
+        // ──────────────────────────────────────────────────────────────────
       } catch (err) {
         sessionSaveError.value = 'Could not load session content.'
       }
     } finally {
       isSessionLoading.value = false
     }
+    return { restored }
   }
 
   // --- Rename helpers ---
@@ -898,53 +990,14 @@ export function useSessionIndex({ document }) {
     // Persist updated index.
     await saveIndex()
 
-    // Also update the session file if it exists.
-    // Best-effort: try the new {id}.json first (typed-JSON-document shape). If that
-    // is not present, fall back to legacy {id}.md (JSON-in-.md shape). If neither
-    // exists yet, no-op — the new name is already in index.json and the session file
-    // will be written on the next saveCurrentSession() in the new shape.
-    const jsonUrl = sessionsRoot() + '/' + id + '.json'
-    const jsonResponse = await ur.hyperFetch(jsonUrl, {
-      method: 'GET',
-      headers: { accept: 'application/json' }
-    })
-
-    if (jsonResponse.ok) {
-      const existingText = await jsonResponse.text()
-      try {
-        const existing = JSON.parse(existingText)
-        if (typeof existing?.schemaVersion === 'number' && Array.isArray(existing?.blocks)) {
-          existing.name = trimmed
-          existing.lastModified = new Date().toISOString()
-          await ur.uploadFile(jsonUrl, JSON.stringify(existing), 'application/json')
-          return
-        }
-      } catch {
-        // Shape mismatch — fall through to legacy .md try.
-      }
-    }
-
-    // Legacy fallback — only attempted if no .json exists. We rewrite the legacy
-    // session_name in place so old clients keep seeing the new name; subsequent
-    // saveCurrentSession() will write the new .json shape and supersede this.
-    const mdUrl = sessionsRoot() + '/' + id + '.md'
-    const mdResponse = await ur.hyperFetch(mdUrl, {
-      method: 'GET',
-      headers: { accept: 'application/json' }
-    })
-
-    if (mdResponse.ok) {
-      const existingText = await mdResponse.text()
-      try {
-        const existing = JSON.parse(existingText)
-        existing.session_name = trimmed
-        await ur.uploadFile(mdUrl, JSON.stringify(existing), 'application/json')
-      } catch {
-        // text+frontmatter or unexpected — leave file alone. index.json carries the
-        // authoritative name; next saveCurrentSession() writes the new .json shape.
-      }
-    }
-    // 404 on both = file not yet saved; name will be written on next saveCurrentSession().
+    // Path 9 DROPPED (Cycle 046, 2026-05-23) — rename no longer GETs +
+    // re-PUTs the session body to update its embedded `name` field. The
+    // body's `session_name` becomes stale until the next autosave writes
+    // it, which is acceptable: the panel shows the index entry's `name`
+    // (authoritative), not the body's. Dropping the in-band body PATCH
+    // removes the "rename drops in-flight edits" failure mode (rename
+    // racing against a queued autosave of the body would clobber the
+    // in-flight content).
   }
 
   /**
@@ -1031,17 +1084,28 @@ export function useSessionIndex({ document }) {
     // that may still exist for sessions created before the typed-JSON-document
     // format). 404 / 405 / network errors on either are acceptable — the index has
     // already been updated and is the authoritative session list.
+    //
+    // BareFileSave 2026-05-23: switched from raw ur.hyperFetch DELETE (which left
+    // local rdfStore stale and silently swallowed all errors) to ur.deleteURI —
+    // canonical primitive that DELETEs on the server AND prunes both directions
+    // of rdfStore (`(*, *, uri)` and `(uri, *, *)`). Failures emit a console.warn
+    // and surface on sessionDeleteError (non-blocking) per the brief.
     const jsonUrl = sessionsRoot() + '/' + id + '.json'
     const mdUrl = sessionsRoot() + '/' + id + '.md'
+    sessionDeleteError.value = null
     try {
-      await ur.hyperFetch(jsonUrl, { method: 'DELETE' })
-    } catch {
-      // ignore
+      const okJson = await ur.deleteURI(jsonUrl)
+      if (!okJson) console.warn('[useSessionIndex] deleteURI returned false for', jsonUrl)
+    } catch (err) {
+      console.warn('[useSessionIndex] deleteURI threw for', jsonUrl, err?.message || err)
+      sessionDeleteError.value = `Could not delete session file (${err?.message || 'unknown error'})`
     }
     try {
-      await ur.hyperFetch(mdUrl, { method: 'DELETE' })
-    } catch {
-      // ignore
+      // ur.deleteURI returns false for 404, which is the expected case for sessions
+      // that never had a .md companion file. Don't warn on that.
+      await ur.deleteURI(mdUrl)
+    } catch (err) {
+      console.warn('[useSessionIndex] deleteURI threw for legacy', mdUrl, err?.message || err)
     }
   }
 
@@ -1061,19 +1125,17 @@ export function useSessionIndex({ document }) {
    * Spec: 3P.F.SessionSave autosave trigger.
    */
   function setupSessionAutosave(debouncedMs = 180000) {
-    // Change-aware watcher (Cycle 045 iter-2, 2026-05-21).
+    // Change-aware watcher (Cycle 045 iter-2, 2026-05-21; updated Cycle 046
+    // 2026-05-23 to route saves through the canonical background-save queue
+    // per Reference_Code_TwinPod-OptimisticSaveQueue).
     //
-    // Per Kai's correction: the previous unconditional watcher fired on ANY
-    // mutation of the document ref — including hydration (loadSession sets
-    // document.value), scroll-restore, and other reactive re-assignments
-    // that did NOT represent a user edit. That produced spurious autosaves
-    // on every load.
-    //
-    // Fix: only consider a mutation a "real edit" if the new content differs
-    // from the last-saved snapshot (_lastSavedContent). This still catches
-    // Tom-bot writes (those genuinely change content) but ignores no-op
-    // re-assignments. Watching `document` itself is preserved so the user's
-    // own keystrokes still trigger the autosave path.
+    // The watcher gates on content equality (suppresses hydration / scroll-
+    // restore re-assignments) and on debounce. When the debounce fires it
+    // hands off to enqueueWorkbookSave, which enqueues via ur.enqueueSave
+    // (FIFO-per-resourceKey). The queue is responsible for serialising
+    // concurrent saves and surfacing status via useBackgroundSave /
+    // <SaveStatusBadge />. The watcher does NOT call saveCurrentSession
+    // directly any more — see enqueueWorkbookSave below.
     watch(document, (newDoc) => {
       const current = newDoc ?? ''
       if (current === _lastSavedContent) {
@@ -1087,10 +1149,11 @@ export function useSessionIndex({ document }) {
 
       clearTimeout(_autosaveTimer)
       _autosaveTimer = setTimeout(() => {
+        _autosaveTimer = null
         if (!isDirty.value || !activeSessionId.value) return
         const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
           ?? 'Session'
-        saveCurrentSession(name)
+        enqueueWorkbookSave(name)
       }, debouncedMs)
     }, { immediate: false })
 
@@ -1131,35 +1194,175 @@ export function useSessionIndex({ document }) {
     await saveCurrentSession(name)
   }
 
+  // --- Canonical background-save entry points (Cycle 046, 2026-05-23) ---
+  //
+  // enqueueWorkbookSave + flushPendingSaves are the canonical entry points
+  // for ALL workbook saves. They route through the background-save queue
+  // (ur.enqueueSave) per Reference_Code_TwinPod-OptimisticSaveQueue —
+  // serialised FIFO per resourceKey (the session JSON URL), with status
+  // surfaced via useBackgroundSave + <SaveStatusBadge />.
+  //
+  // Existing callers (saveActiveSession, ensureSessionSaved, callers that
+  // call saveCurrentSession directly) are wrapped to go through the queue
+  // so all save paths share the same serialisation guarantee — no two
+  // saves of the same session can race the 5-step lifecycle even in a
+  // pathological click-storm.
+  //
+  // Trigger reduction (Cycle 046): the previous 11+ trigger paths
+  // collapse to 3 canonical triggers (per Kai's 5-point design):
+  //   1. Debounced typing — setupSessionAutosave watcher (above) ends in
+  //      enqueueWorkbookSave on debounce fire.
+  //   2. Lifecycle gate — beforeunload / switchToSession / createNewSession /
+  //      wrappedLogout / wrappedStartCheckout call flushPendingSaves(timeoutMs).
+  //      beforeunload uses timeoutMs=0 (snapshot to localStorage; no await).
+  //   3. Explicit Save / workspace-pane click delegate → flushPendingSaves().
+
+  /**
+   * Canonical workbook-save entry point. Enqueues a save of the active
+   * session through the background-save queue (ur.enqueueSave) and returns
+   * the job id (or null when there is nothing to save). Synchronous return
+   * — the actual write happens in the queue.
+   *
+   * The job's resourceKey is the session JSON URL. Saves of the same
+   * session serialise FIFO; saves of different sessions can run in
+   * parallel (which is fine — they target different resources).
+   *
+   * Guard C — the localStorage backup is written synchronously BEFORE the
+   * queue enqueue, so even if the browser dies before the queue drains the
+   * work is recoverable at next boot.
+   *
+   * @param {string} [name] - Session name to persist. Defaults to current
+   *                          name from sessionList.
+   * @returns {string | null} The queue job id, or null when no active session.
+   */
+  function enqueueWorkbookSave(name) {
+    if (!_podRoot || !activeSessionId.value) return null
+    const id = activeSessionId.value
+    const sessionName = name
+      ?? sessionList.value.find(s => s.id === id)?.name
+      ?? 'Session'
+    // Guard C — synchronous localStorage backup BEFORE enqueue. Survives
+    // browser close even if the queued task never runs. saveCurrentSession
+    // will also re-write the backup right before the network call, but
+    // doing it here makes the close-while-queued window safe too.
+    _writeLocalStorageBackup(id, document.value ?? '')
+    const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+    return ur.enqueueSave({
+      resourceKey: sessionFileUrl,
+      label: 'workbook-save',
+      task: () => saveCurrentSession(sessionName)
+    })
+  }
+
+  /**
+   * Flush any pending debounce + await queue drain for the active session.
+   * Canonical entry point for lifecycle gates (beforeunload, switchToSession,
+   * createNewSession, wrappedLogout, wrappedStartCheckout, explicit Save
+   * button, workspace-pane click delegate).
+   *
+   * Semantics:
+   *   - Cancels any pending autosave debounce timer.
+   *   - If document content differs from last-saved snapshot, enqueues a
+   *     save synchronously (so beforeunload-snapshot work is captured in
+   *     the localStorage backup even when timeoutMs=0).
+   *   - Awaits queue drain for the active session up to timeoutMs.
+   *   - timeoutMs=0 returns immediately AFTER the synchronous backup +
+   *     enqueue — DO NOT await. This is the beforeunload contract: the
+   *     browser will cancel in-flight fetches on unload anyway, so the
+   *     localStorage backup (Guard C) is the recovery path.
+   *
+   * @param {number} [timeoutMs=3000] - Max ms to wait for the queue to drain
+   *                                    after enqueueing the (optional) save.
+   *                                    0 = synchronous-snapshot only.
+   * @returns {Promise<boolean>} true on clean drain (or no-op), false on timeout.
+   */
+  async function flushPendingSaves(timeoutMs = 3000) {
+    // 1. Cancel any pending debounce — about to flush.
+    if (_autosaveTimer) {
+      clearTimeout(_autosaveTimer)
+      _autosaveTimer = null
+    }
+    // 2. Nothing to do when there is no active session / no podRoot.
+    if (!_podRoot || !activeSessionId.value) return true
+    // 3. Enqueue a save only when content actually differs from the last
+    //    saved snapshot (avoids spurious PUTs on lifecycle transitions
+    //    when the user did nothing). The dirty-flag is a hint that
+    //    historically over-fired (see Guard A REMOVED comment); the
+    //    content-comparison is the authoritative truth.
+    const current = document.value ?? ''
+    const needsSave = current !== _lastSavedContent
+    let jobId = null
+    if (needsSave) {
+      jobId = enqueueWorkbookSave()
+    }
+    // 4. timeoutMs=0 — synchronous-snapshot mode (beforeunload). Backup
+    //    was written inside enqueueWorkbookSave; queue task will run if
+    //    the JS context survives long enough, otherwise localStorage is
+    //    the recovery path. Return immediately without awaiting.
+    if (timeoutMs === 0) return true
+    // 5. Await drain. If we enqueued, wait for THIS job's terminal event.
+    //    If we did NOT enqueue (no-op flush) but a prior autosave is in
+    //    flight, watch for any in-flight task on our resourceKey and wait
+    //    for its terminal event. Otherwise resolve immediately.
+    const sessionFileUrl = sessionsRoot() + '/' + activeSessionId.value + '.json'
+    return await new Promise((resolve) => {
+      let settled = false
+      let watchedJobId = jobId
+      const overallTimer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        unsubscribe()
+        resolve(false)
+      }, timeoutMs)
+      const settleWith = (ok) => {
+        if (settled) return
+        settled = true
+        clearTimeout(overallTimer)
+        unsubscribe()
+        resolve(ok)
+      }
+      const unsubscribe = ur.onSaveEvent((evt) => {
+        // Only events for our session resource matter.
+        if (evt.resourceKey !== sessionFileUrl) return
+        // If we did not enqueue and a prior autosave is still in flight,
+        // adopt its id and wait for its terminal event.
+        if (!watchedJobId && (evt.type === 'queued' || evt.type === 'started')) {
+          watchedJobId = evt.id
+          return
+        }
+        if (watchedJobId && evt.id === watchedJobId) {
+          if (evt.type === 'succeeded') return settleWith(true)
+          if (evt.type === 'failed') return settleWith(false)
+        }
+      })
+      // No enqueue + no prior task expected: short-circuit immediately so
+      // callers do not wait for the overallTimer on a clean state.
+      if (!jobId) {
+        // Yield a microtask so any in-flight `queued`/`started` for the
+        // same key (e.g. enqueued moments before from another path) can
+        // be observed before we settle clean.
+        queueMicrotask(() => {
+          if (!watchedJobId) settleWith(true)
+        })
+      }
+    })
+  }
+
   /**
    * Guard B (Emergency 2026-05-14) — pre-redirect save with timeout.
    *
-   * Awaits an in-flight saveCurrentSession before an external navigation
-   * (Stripe Checkout, OIDC, logout). When the pod is slow, a hard timeout
-   * lets the redirect proceed so the user's payment intent is not blocked
-   * — the localStorage backup (Guard C) still preserves their work.
-   *
-   * Does not block when isDirty is false (nothing to save).
+   * Compatibility shim (Cycle 046, 2026-05-23) — delegates to
+   * flushPendingSaves which is the canonical lifecycle-gate entry point.
+   * Existing App.vue callers (wrappedLogout / wrappedStartCheckout) keep
+   * working unchanged.
    *
    * @param {number} [timeoutMs=3000] - Max wait before yielding to the redirect.
    * @returns {Promise<boolean>} true on completed save or clean state; false on timeout/error.
    */
   async function ensureSessionSaved(timeoutMs = 3000) {
-    if (!isDirty.value) return true
-    if (!activeSessionId.value || !_podRoot) return true
-    const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
-      ?? 'Session'
     try {
-      await Promise.race([
-        saveCurrentSession(name),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('save timeout')), timeoutMs)
-        )
-      ])
-      return true
+      return await flushPendingSaves(timeoutMs)
     } catch (e) {
-      // Log but do NOT throw — caller will redirect anyway. The localStorage
-      // backup written inside saveCurrentSession (Guard C) is the safety net.
       console.warn('[emergency-save] save before redirect failed', e)
       return false
     }
@@ -1250,6 +1453,7 @@ export function useSessionIndex({ document }) {
     indexLoadError,
     sessionSaving,
     sessionSaveError,
+    sessionDeleteError,
     isSessionLoading,
     isDirty,
     setPodRoot,
@@ -1267,6 +1471,9 @@ export function useSessionIndex({ document }) {
     // Emergency hotfix 2026-05-14 — data-loss defense-in-depth helpers.
     ensureSessionSaved,
     restoreLocalStorageDraftIfNewer,
-    restoreScratchDraftIfFresh
+    restoreScratchDraftIfFresh,
+    // Canonical background-save entry points (Cycle 046, 2026-05-23).
+    enqueueWorkbookSave,
+    flushPendingSaves
   }
 }
