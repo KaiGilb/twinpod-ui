@@ -246,8 +246,13 @@ describe('useCreditLedger — Group 5 queue routing (BareFileSave 2026-05-23)', 
     else delete globalThis.window
   })
 
-  test('all four write paths share the same resourceKey (ledger URL)', async () => {
-    // Smoke-check: enqueueSave when called gets the canonical resourceKey.
+  test('queue routing uses the canonical ledger-URL resourceKey (whitelist-grant path)', async () => {
+    // Structural invariant: every enqueueSave call from useCreditLedger uses
+    // the ledger URL as resourceKey so FIFO serialisation applies across all
+    // four write paths. This test only directly exercises the whitelist-grant-
+    // on-top path; the other three paths (applyPendingCredits / writeTrialStart
+    // / decrementCredit) all call _enqueueLedgerWrite with the same ledgerUrl
+    // constant — verified by file inspection but not enumerated here.
     const { useCreditLedger } = await import('./useCreditLedger.js')
     const podRoot = 'https://tst-plannereu.twinpod.eu'
     const ledgerUrl = podRoot + '/apps/TomTwin/thebrain-credits.json'
