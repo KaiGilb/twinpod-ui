@@ -480,8 +480,25 @@ export function useSessionIndex({ document }) {
     try {
       // Read the canonical (new) index first.
       const primary = await fetchIndex(sessionsRoot())
-      // Then read the legacy index (read-only, for migrating users with pre-rename data).
-      const legacy = await fetchIndex(legacySessionsRoot())
+
+      // Cycle 048 fix (2026-05-24) — eliminate the per-login legacy `index.json`
+      // 404 (or wasted round-trip) for migrated users by only reading the legacy
+      // path when the primary returned nothing. After a user has triggered any
+      // saveIndex() post-rename, the primary contains the full merged list
+      // (including formerly-legacy entries) and a second legacy fetch only
+      // produces network noise (a 404 in the most common case, since the
+      // legacy `index.json` is never deleted but is never re-written either —
+      // it stays as a historical artefact). The merge semantics ("primary wins
+      // on id collision") become a no-op the moment primary holds the full set.
+      //
+      // Pre-migration users (primary genuinely empty/404) still get the legacy
+      // fallback so their existing data surfaces unchanged. Eager write-up of
+      // legacy into primary is deferred — landing it here would introduce a
+      // pod write on every cold load for the duration of the migration, which
+      // is a separate decision from the network-noise fix.
+      const legacy = primary.entries === null
+        ? await fetchIndex(legacySessionsRoot())
+        : { entries: null, status: 0 }
 
       // Merge: new index entries win on id collision (a re-saved legacy session has
       // moved into the new index and should not appear twice).
@@ -497,8 +514,11 @@ export function useSessionIndex({ document }) {
         }
       }
 
-      // Both sources missing AND both responded non-404 → treat as a real error.
-      // Otherwise: 404 on either is just "first use" or "no legacy data" — fine.
+      // Both sources missing AND primary responded with a real error (5xx,
+      // network failure) → surface as a load error. Otherwise: 404 on either
+      // is just "first use" or "no legacy data" — fine. (The legacy fetch is
+      // only consulted when primary === null, so a legacy real-error need
+      // not be checked separately — primary already supplied null.)
       const primaryReal = primary.status !== 0 && primary.status !== 404
       const legacyReal = legacy.status !== 0 && legacy.status !== 404
       if (
