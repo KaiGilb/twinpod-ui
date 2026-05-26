@@ -105,7 +105,7 @@ function connect(url) {
         {{ props.appTitle }}
         <span class="login__title-sub">{{ props.appSubtitle }}</span>
       </h1>
-      <p class="login__subtitle">Connect your TwinPod to get started</p>
+      <p class="login__subtitle">Get started, select your TwinPod&trade; location</p>
 
       <!-- Primary servers — each button connects immediately on click -->
       <div class="login__server-select login__server-select--primary" role="group" aria-label="Choose TwinPod server">
