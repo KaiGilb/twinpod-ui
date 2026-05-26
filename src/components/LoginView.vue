@@ -29,7 +29,7 @@
  * @see Spec: /Users/kaigilb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Kai-Zen-Vault/5 - Project/NoteWorld/01Planning/NoteWorld-Specs/3P.F.TwinPodLoginScreen.md
  */
 
-import { ref, inject, computed } from 'vue'
+import { ref, inject, computed, useSlots } from 'vue'
 
 // Per-app identity — defaults preserve The Brain's existing text without code changes.
 const props = defineProps({
@@ -51,6 +51,17 @@ const props = defineProps({
 const rootStyle = computed(() => ({
   backgroundImage: `url('${props.backgroundImage}')`
 }))
+
+// Detect whether the consumer passed any content into the `marketing` slot.
+// When the slot is empty (default for NoteWorld), the layout collapses to the
+// single-column login card it had before v0.5.0. When the slot has content
+// (e.g. TheBrain passes TED + Graphmetrix attribution), the card sits on top
+// and the marketing block sits BELOW it on both PC and mobile (v0.6.0 —
+// previous v0.5.0 two-column split was replaced after Kai's browser test).
+// The consumer is responsible for arranging multiple items inside the slot
+// (e.g. side-by-side TED + attribution on PC) via its own wrapper styles.
+const slots = useSlots()
+const hasMarketing = computed(() => !!slots.marketing)
 
 // Auth state and actions are provided by App.vue root component.
 const { login, error, loading } = inject('auth')
@@ -83,13 +94,18 @@ function connect(url) {
 </script>
 
 <template>
-  <main class="login__root" :style="rootStyle">
-    <div class="login__card">
+  <main
+    class="login__root"
+    :class="{ 'login__root--with-marketing': hasMarketing }"
+    :style="rootStyle"
+  >
+    <div class="login__layout">
+      <div class="login__card">
       <h1 class="login__title">
         {{ props.appTitle }}
         <span class="login__title-sub">{{ props.appSubtitle }}</span>
       </h1>
-      <p class="login__subtitle">Connect your TwinPod to get started</p>
+      <p class="login__subtitle">Get started, select your TwinPod&trade; location</p>
 
       <!-- Primary servers — each button connects immediately on click -->
       <div class="login__server-select login__server-select--primary" role="group" aria-label="Choose TwinPod server">
@@ -168,6 +184,23 @@ function connect(url) {
       >
         {{ error.message }}
       </p>
+      </div>
+
+      <!--
+        Marketing slot — empty by default (NoteWorld and other apps that
+        do not need marketing content). When populated (e.g. TheBrain
+        passes a TED embed + Graphmetrix attribution), it sits BELOW the
+        login card on both PC and mobile (v0.6.0 layout). The consumer
+        controls any internal arrangement of multiple items via its own
+        wrapper styles inside the slot content.
+      -->
+      <section
+        v-if="hasMarketing"
+        class="login__marketing"
+        aria-label="About this app"
+      >
+        <slot name="marketing" />
+      </section>
     </div>
   </main>
 </template>
@@ -194,6 +227,32 @@ function connect(url) {
   background-position: center center;
   background-repeat: no-repeat;
   background-color: #0a1220; /* fallback while image loads */
+}
+
+/*
+ * Outer layout — v0.6.0 (marketing-slot below card on all viewports).
+ * - No marketing slot (default): single column, card centred. Behaviour
+ *   identical to pre-v0.5.0 (NoteWorld backward-compat preserved).
+ * - With marketing slot: single column, card on TOP, marketing BELOW it
+ *   on both PC and mobile. The slot consumer arranges its own internal
+ *   layout (e.g. row-on-PC / column-on-mobile for two side-by-side cards).
+ *   This replaces the v0.5.0 two-column-on-PC split per Kai's 2026-05-26
+ *   browser-test feedback.
+ */
+.login__layout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+  width: 100%;
+  max-width: 360px;
+}
+
+.login__marketing {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  width: 100%;
 }
 
 .login__card {
@@ -411,5 +470,24 @@ function connect(url) {
     font-size: 1.4rem;
   }
 
+  /*
+   * With-marketing PC layout (v0.6.0) — single-column stack stays, but
+   * the LAYOUT widens so the marketing slot below the card can lay its
+   * own children side-by-side. The CARD itself stays bounded at the
+   * roomy-desktop max-width above (400px) so it doesn't stretch. The
+   * layout container widens to 800px so the slot has room for two
+   * columns inside it.
+   */
+  .login__root--with-marketing .login__layout {
+    max-width: 800px;
+    gap: 1.5rem;
+  }
+}
+
+/* Wider desktops: a touch more breathing room around the marketing block */
+@media (min-width: 1024px) {
+  .login__root--with-marketing .login__layout {
+    gap: 2rem;
+  }
 }
 </style>
