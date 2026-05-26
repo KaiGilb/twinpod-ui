@@ -55,9 +55,11 @@ const rootStyle = computed(() => ({
 // Detect whether the consumer passed any content into the `marketing` slot.
 // When the slot is empty (default for NoteWorld), the layout collapses to the
 // single-column login card it had before v0.5.0. When the slot has content
-// (e.g. TheBrain passes TED + Graphmetrix attribution), the layout splits
-// two-column on PC (marketing on the LEFT, card on the RIGHT) and stacks
-// the marketing block BELOW the card on mobile.
+// (e.g. TheBrain passes TED + Graphmetrix attribution), the card sits on top
+// and the marketing block sits BELOW it on both PC and mobile (v0.6.0 —
+// previous v0.5.0 two-column split was replaced after Kai's browser test).
+// The consumer is responsible for arranging multiple items inside the slot
+// (e.g. side-by-side TED + attribution on PC) via its own wrapper styles.
 const slots = useSlots()
 const hasMarketing = computed(() => !!slots.marketing)
 
@@ -98,20 +100,6 @@ function connect(url) {
     :style="rootStyle"
   >
     <div class="login__layout">
-      <!--
-        Marketing slot — empty by default (NoteWorld and other apps that
-        do not need a marketing column). When populated (e.g. TheBrain
-        passes a TED embed + Graphmetrix attribution), it sits on the
-        LEFT of the card on PC (>=768px) and BELOW the card on mobile.
-      -->
-      <section
-        v-if="hasMarketing"
-        class="login__marketing"
-        aria-label="About this app"
-      >
-        <slot name="marketing" />
-      </section>
-
       <div class="login__card">
       <h1 class="login__title">
         {{ props.appTitle }}
@@ -197,6 +185,22 @@ function connect(url) {
         {{ error.message }}
       </p>
       </div>
+
+      <!--
+        Marketing slot — empty by default (NoteWorld and other apps that
+        do not need marketing content). When populated (e.g. TheBrain
+        passes a TED embed + Graphmetrix attribution), it sits BELOW the
+        login card on both PC and mobile (v0.6.0 layout). The consumer
+        controls any internal arrangement of multiple items via its own
+        wrapper styles inside the slot content.
+      -->
+      <section
+        v-if="hasMarketing"
+        class="login__marketing"
+        aria-label="About this app"
+      >
+        <slot name="marketing" />
+      </section>
     </div>
   </main>
 </template>
@@ -226,12 +230,14 @@ function connect(url) {
 }
 
 /*
- * Outer layout — v0.5.0 (marketing-slot addition).
+ * Outer layout — v0.6.0 (marketing-slot below card on all viewports).
  * - No marketing slot (default): single column, card centred. Behaviour
- *   identical to pre-v0.5.0.
- * - With marketing slot: mobile stacks card-on-top / marketing-below
- *   via flex order. PC (>=768px) flips to a two-column row with the
- *   marketing column on the LEFT and the card on the RIGHT.
+ *   identical to pre-v0.5.0 (NoteWorld backward-compat preserved).
+ * - With marketing slot: single column, card on TOP, marketing BELOW it
+ *   on both PC and mobile. The slot consumer arranges its own internal
+ *   layout (e.g. row-on-PC / column-on-mobile for two side-by-side cards).
+ *   This replaces the v0.5.0 two-column-on-PC split per Kai's 2026-05-26
+ *   browser-test feedback.
  */
 .login__layout {
   display: flex;
@@ -247,9 +253,6 @@ function connect(url) {
   flex-direction: column;
   gap: 0.875rem;
   width: 100%;
-  /* Mobile: marketing block sits BELOW the card. Card has no order set
-     so it defaults to 0; marketing gets order 2 so it follows. */
-  order: 2;
 }
 
 .login__card {
@@ -468,34 +471,23 @@ function connect(url) {
   }
 
   /*
-   * PC two-column split — only applied when a marketing slot is present.
-   * Marketing column on the LEFT (order 0), card on the RIGHT (order 1).
-   * Each column ~400px wide; layout max-width ~880px gives a 2rem gap.
+   * With-marketing PC layout (v0.6.0) — single-column stack stays, but
+   * the LAYOUT widens so the marketing slot below the card can lay its
+   * own children side-by-side. The CARD itself stays bounded at the
+   * roomy-desktop max-width above (400px) so it doesn't stretch. The
+   * layout container widens to 800px so the slot has room for two
+   * columns inside it.
    */
   .login__root--with-marketing .login__layout {
-    flex-direction: row;
-    align-items: center;
-    justify-content: center;
-    gap: 2rem;
-    max-width: 880px;
-  }
-
-  .login__root--with-marketing .login__marketing {
-    order: 0;
-    flex: 0 0 400px;
-    max-width: 400px;
-  }
-
-  .login__root--with-marketing .login__card {
-    order: 1;
-    flex: 0 0 400px;
+    max-width: 800px;
+    gap: 1.5rem;
   }
 }
 
-/* Wider desktops: a touch more breathing room when marketing column present */
+/* Wider desktops: a touch more breathing room around the marketing block */
 @media (min-width: 1024px) {
   .login__root--with-marketing .login__layout {
-    gap: 2.5rem;
+    gap: 2rem;
   }
 }
 </style>
