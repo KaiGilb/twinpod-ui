@@ -29,7 +29,7 @@
  * @see Spec: /Users/kaigilb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Kai-Zen-Vault/5 - Project/NoteWorld/01Planning/NoteWorld-Specs/3P.F.TwinPodLoginScreen.md
  */
 
-import { ref, inject, computed } from 'vue'
+import { ref, inject, computed, useSlots } from 'vue'
 
 // Per-app identity — defaults preserve The Brain's existing text without code changes.
 const props = defineProps({
@@ -51,6 +51,15 @@ const props = defineProps({
 const rootStyle = computed(() => ({
   backgroundImage: `url('${props.backgroundImage}')`
 }))
+
+// Detect whether the consumer passed any content into the `marketing` slot.
+// When the slot is empty (default for NoteWorld), the layout collapses to the
+// single-column login card it had before v0.5.0. When the slot has content
+// (e.g. TheBrain passes TED + Graphmetrix attribution), the layout splits
+// two-column on PC (marketing on the LEFT, card on the RIGHT) and stacks
+// the marketing block BELOW the card on mobile.
+const slots = useSlots()
+const hasMarketing = computed(() => !!slots.marketing)
 
 // Auth state and actions are provided by App.vue root component.
 const { login, error, loading } = inject('auth')
@@ -83,8 +92,27 @@ function connect(url) {
 </script>
 
 <template>
-  <main class="login__root" :style="rootStyle">
-    <div class="login__card">
+  <main
+    class="login__root"
+    :class="{ 'login__root--with-marketing': hasMarketing }"
+    :style="rootStyle"
+  >
+    <div class="login__layout">
+      <!--
+        Marketing slot — empty by default (NoteWorld and other apps that
+        do not need a marketing column). When populated (e.g. TheBrain
+        passes a TED embed + Graphmetrix attribution), it sits on the
+        LEFT of the card on PC (>=768px) and BELOW the card on mobile.
+      -->
+      <section
+        v-if="hasMarketing"
+        class="login__marketing"
+        aria-label="About this app"
+      >
+        <slot name="marketing" />
+      </section>
+
+      <div class="login__card">
       <h1 class="login__title">
         {{ props.appTitle }}
         <span class="login__title-sub">{{ props.appSubtitle }}</span>
@@ -168,6 +196,7 @@ function connect(url) {
       >
         {{ error.message }}
       </p>
+      </div>
     </div>
   </main>
 </template>
@@ -194,6 +223,33 @@ function connect(url) {
   background-position: center center;
   background-repeat: no-repeat;
   background-color: #0a1220; /* fallback while image loads */
+}
+
+/*
+ * Outer layout — v0.5.0 (marketing-slot addition).
+ * - No marketing slot (default): single column, card centred. Behaviour
+ *   identical to pre-v0.5.0.
+ * - With marketing slot: mobile stacks card-on-top / marketing-below
+ *   via flex order. PC (>=768px) flips to a two-column row with the
+ *   marketing column on the LEFT and the card on the RIGHT.
+ */
+.login__layout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+  width: 100%;
+  max-width: 360px;
+}
+
+.login__marketing {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  width: 100%;
+  /* Mobile: marketing block sits BELOW the card. Card has no order set
+     so it defaults to 0; marketing gets order 2 so it follows. */
+  order: 2;
 }
 
 .login__card {
@@ -411,5 +467,35 @@ function connect(url) {
     font-size: 1.4rem;
   }
 
+  /*
+   * PC two-column split — only applied when a marketing slot is present.
+   * Marketing column on the LEFT (order 0), card on the RIGHT (order 1).
+   * Each column ~400px wide; layout max-width ~880px gives a 2rem gap.
+   */
+  .login__root--with-marketing .login__layout {
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 2rem;
+    max-width: 880px;
+  }
+
+  .login__root--with-marketing .login__marketing {
+    order: 0;
+    flex: 0 0 400px;
+    max-width: 400px;
+  }
+
+  .login__root--with-marketing .login__card {
+    order: 1;
+    flex: 0 0 400px;
+  }
+}
+
+/* Wider desktops: a touch more breathing room when marketing column present */
+@media (min-width: 1024px) {
+  .login__root--with-marketing .login__layout {
+    gap: 2.5rem;
+  }
 }
 </style>
