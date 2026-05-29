@@ -203,6 +203,90 @@ describe('useCreditLedger — Evo9.WebIDFreeCredit grant-on-top branch (Cycle 04
 
 })
 
+// Item 7 (2026-05-29) — credit-based free trial. A new, non-whitelisted user
+// with no existing pod ledger is granted INITIAL_FREE_CREDITS up front; the
+// grant is written to the pod with trialUsed=true so it is given exactly once.
+describe('useCreditLedger — credit-based free-trial grant (item 7)', () => {
+
+  // Helper: a 404 ledger GET (no pod ledger yet = first-time user).
+  function ledger404Response() {
+    return {
+      ok: false,
+      status: 404,
+      headers: { get: () => null },
+      json: async () => ({})
+    }
+  }
+
+  test('non-whitelisted first-time user (404) → balance becomes INITIAL_FREE_CREDITS, trialUsed=true, uploadJSON fires', async () => {
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+
+    const auth = makeAuthFetch(ledger404Response())
+    mockUploadJSON.mockResolvedValueOnce({ ok: true, status: 200 })
+
+    const { balance, ledger, trialUsed, loadCredits } = useCreditLedger()
+    await loadCredits(
+      'https://newbie.demo.systemtwin.com',
+      'tok',
+      auth,
+      'https://newbie.demo.systemtwin.com/i'
+    )
+
+    // The default allotment is 50 credits (the single tuning knob in the source).
+    expect(balance.value).toBe(50)
+    // Grant is marked given so the gate (balance===0 && trialUsed) fires once spent.
+    expect(trialUsed.value).toBe(true)
+    expect(ledger.value).toHaveLength(1)
+    expect(ledger.value[0].type).toBe('grant')
+    expect(ledger.value[0].reason).toBe('free-trial')
+    expect(ledger.value[0].credits).toBe(50)
+
+    // The grant is persisted to the pod so a returning user is not re-granted.
+    expect(mockUploadJSON).toHaveBeenCalledTimes(1)
+    const [putUrl, putBodyRaw] = mockUploadJSON.mock.calls[0]
+    expect(putUrl).toBe('https://newbie.demo.systemtwin.com/apps/TomTwin/thebrain-credits.json')
+    const body = JSON.parse(putBodyRaw)
+    expect(body.balance).toBe(50)
+    expect(body.trialUsed).toBe(true)
+    expect(body.ledger[0].reason).toBe('free-trial')
+
+    // Queue used the canonical ledger-URL resourceKey.
+    expect(mockEnqueueSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resourceKey: 'https://newbie.demo.systemtwin.com/apps/TomTwin/thebrain-credits.json'
+      })
+    )
+  })
+
+  test('returning user who spent the grant (balance 0, trialUsed true) → unchanged, NOT re-granted', async () => {
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+
+    const spent = {
+      balance: 0,
+      ledger: [{ type: 'grant', credits: 50, reason: 'free-trial', ts: '2026-05-29T09:00:00Z' }],
+      processedEvents: [],
+      updatedAt: '2026-05-29T10:00:00Z',
+      trialUsed: true,
+      trialStartedAt: null
+    }
+    const auth = makeAuthFetch(realLedgerResponse(spent))
+
+    const { balance, trialUsed, loadCredits } = useCreditLedger()
+    await loadCredits(
+      'https://newbie.demo.systemtwin.com',
+      'tok',
+      auth,
+      'https://newbie.demo.systemtwin.com/i'
+    )
+
+    // Existing ledger is loaded as-is — no fresh grant, no pod write.
+    expect(balance.value).toBe(0)
+    expect(trialUsed.value).toBe(true)
+    expect(mockUploadJSON).not.toHaveBeenCalled()
+  })
+
+})
+
 describe('useCreditLedger — Group 5 queue routing (BareFileSave 2026-05-23)', () => {
 
   test('Guard C — localStorage backup is written BEFORE enqueue and cleared on success', async () => {

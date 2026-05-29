@@ -167,6 +167,23 @@ const FREE_CREDIT_WEBIDS = [
 ]
 const FREE_CREDIT_AMOUNT = 100000
 
+// Free-trial allotment (item 7, 2026-05-29) — credit-based, NOT time-based.
+//
+// Replaces the old 10-minute wall-clock free trial (TRIAL_DURATION_MINUTES).
+// Every new, non-whitelisted user is seeded with this many credits on first
+// login. The credits are consumed ONLY by actual TomTwin usage via the normal
+// per-turn debit (App.vue) — reading books, browsing the glossary, and opening
+// projects are all free and never touch the balance. So a user who goes
+// straight to the library does NOT burn their trial before ever chatting with
+// Tom.
+//
+// Sizing (with the item-5 input+output billing formula): a short chat turn
+// costs ~2 credits; a full plan / document turn costs ~25-30 credits. 50 credits
+// therefore buys roughly ONE plan attempt OR ~25 short chat turns.
+//
+// THIS IS THE SINGLE TUNING KNOB — change this one line to resize the free trial.
+const INITIAL_FREE_CREDITS = 50
+
 /**
  * Ensure a Solid LDP container exists at containerUrl.
  * Issues a HEAD to check; if absent (404), creates it via PUT with Link type header.
@@ -396,14 +413,55 @@ export function useCreditLedger() {
             console.warn('[useCreditLedger] Whitelist grant pod write failed (non-fatal):', writeErr?.message || writeErr)
           }
         } else {
-          // Non-whitelisted first-time user — use defaults (free trial flow)
-          balance.value = 0
-          ledger.value = []
-          trialUsed.value = false
+          // Non-whitelisted first-time user — seed the credit-based free trial.
+          //
+          // Item 7 (2026-05-29): replaces the old time-based 10-minute trial.
+          // The user gets INITIAL_FREE_CREDITS up front; they are spent only by
+          // Tom usage via the normal per-turn debit. trialUsed=true marks the
+          // grant as already given, so when the balance later reaches 0 the gate
+          // (balance===0 && trialUsed) fires and they are NOT re-granted on the
+          // next login. Reading books never touches this balance.
+          const now = new Date().toISOString()
+          const initialLedger = {
+            balance: INITIAL_FREE_CREDITS,
+            ledger: [{ type: 'grant', credits: INITIAL_FREE_CREDITS, reason: 'free-trial', ts: now }],
+            processedEvents: [],
+            updatedAt: now,
+            trialUsed: true,
+            trialStartedAt: null
+          }
+          balance.value = INITIAL_FREE_CREDITS
+          ledger.value = initialLedger.ledger
+          trialUsed.value = true
           trialStartedAt.value = null
-          // Cycle 19 follow-up #5: whitelist branch did NOT match.
           const reason = !webId ? 'webId missing' : 'webId not in FREE_CREDIT_WEBIDS'
-          console.info('[useCreditLedger] no whitelist grant — reason:', reason, 'webId:', webId || '(none)')
+          console.info('[useCreditLedger] free-trial grant applied — reason no whitelist:', reason, 'balance set to:', INITIAL_FREE_CREDITS)
+
+          // Persist the grant so subsequent logins load it normally rather than
+          // re-granting. Routed through the queue with the ledger URL resourceKey,
+          // same as the whitelist branch above. DPoP write happens here (frontend)
+          // because the Worker cannot make DPoP-authenticated pod writes.
+          try {
+            await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+            await _enqueueLedgerWrite({
+              resourceKey: ledgerUrl,
+              label: 'creditLedger-freeTrialInitial',
+              snapshot: initialLedger,
+              task: async () => {
+                const putRes = await ur.uploadJSON(ledgerUrl, JSON.stringify(initialLedger, null, 2))
+                if (!putRes || putRes.ok === false) {
+                  console.warn('[useCreditLedger] free-trial grant PUT non-OK:', putRes?.status)
+                  throw new Error(`free-trial grant PUT failed (${putRes?.status || 0})`)
+                }
+                console.info('[useCreditLedger] free-trial grant PUT ok')
+                return { ok: true }
+              }
+            })
+          } catch (writeErr) {
+            // Non-fatal — balance is already set reactively; pod write is best-effort.
+            console.warn('[useCreditLedger] free-trial grant pod write failed (non-fatal):', writeErr?.message || writeErr)
+          }
         }
       } else {
         console.error('[useCreditLedger] Unexpected status loading ledger:', response.status)
