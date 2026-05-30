@@ -178,11 +178,11 @@ const FREE_CREDIT_AMOUNT = 100000
 // Tom.
 //
 // Sizing (with the item-5 input+output billing formula): a short chat turn
-// costs ~2 credits; a full plan / document turn costs ~25-30 credits. 50 credits
-// therefore buys roughly ONE plan attempt OR ~25 short chat turns.
+// costs ~2 credits; one full Opus spec costs ~55-110 credits. 150 credits
+// therefore buys roughly ONE full spec generation PLUS some chat headroom.
 //
 // THIS IS THE SINGLE TUNING KNOB — change this one line to resize the free trial.
-const INITIAL_FREE_CREDITS = 50
+const INITIAL_FREE_CREDITS = 150
 
 /**
  * Ensure a Solid LDP container exists at containerUrl.

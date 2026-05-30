@@ -232,21 +232,21 @@ describe('useCreditLedger — credit-based free-trial grant (item 7)', () => {
       'https://newbie.demo.systemtwin.com/i'
     )
 
-    // The default allotment is 50 credits (the single tuning knob in the source).
-    expect(balance.value).toBe(50)
+    // The default allotment is 150 credits (the single tuning knob in the source).
+    expect(balance.value).toBe(150)
     // Grant is marked given so the gate (balance===0 && trialUsed) fires once spent.
     expect(trialUsed.value).toBe(true)
     expect(ledger.value).toHaveLength(1)
     expect(ledger.value[0].type).toBe('grant')
     expect(ledger.value[0].reason).toBe('free-trial')
-    expect(ledger.value[0].credits).toBe(50)
+    expect(ledger.value[0].credits).toBe(150)
 
     // The grant is persisted to the pod so a returning user is not re-granted.
     expect(mockUploadJSON).toHaveBeenCalledTimes(1)
     const [putUrl, putBodyRaw] = mockUploadJSON.mock.calls[0]
     expect(putUrl).toBe('https://newbie.demo.systemtwin.com/apps/TomTwin/thebrain-credits.json')
     const body = JSON.parse(putBodyRaw)
-    expect(body.balance).toBe(50)
+    expect(body.balance).toBe(150)
     expect(body.trialUsed).toBe(true)
     expect(body.ledger[0].reason).toBe('free-trial')
 
