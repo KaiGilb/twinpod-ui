@@ -38,6 +38,7 @@
  *   sessionSaving:        import('vue').Ref<boolean>,
  *   sessionSaveError:     import('vue').Ref<string|null>,
  *   isSessionLoading:     import('vue').Ref<boolean>,
+ *   isSavingProject:      import('vue').Ref<boolean>,
  *   isDirty:              import('vue').Ref<boolean>,
  *   loadIndex:            () => Promise<void>,
  *   saveIndex:            () => Promise<void>,
@@ -121,6 +122,20 @@ const sessionDeleteError = ref(null)
 // finally block so a thrown loadSession does not leave it stuck.
 const isSessionLoading = ref(false)
 
+// isSavingProject drives the "Saving Project..." overlay in
+// WorkspacePane.vue — the sibling of isSessionLoading for the NEW-project
+// save path. The first save of a brand-new project takes 8+ seconds (the
+// index.json PUT, plus a name PUT when the project is created via the name
+// modal), during which the user previously had zero feedback. This flag is
+// toggled by App.vue's create-project wrappers (createNewSessionWithUrlSync
+// / createNewProjectWithName) in a try/finally so it spans the FULL
+// operation (create + optional rename + route push), not just the bare
+// createNewSession() index write. It is deliberately NOT toggled inside
+// createNewSession() itself, and is NOT touched by the debounced autosave
+// path (enqueueWorkbookSave / flushPendingSaves) — so the full-pane overlay
+// never flashes during normal typing of an already-open project.
+const isSavingProject = ref(false)
+
 // isDirty tracks unsaved changes in workbookContent.
 // Set to true by watch on workbookContent after initial load.
 // Reset to false before each saveCurrentSession() call (prevent double-save race).
@@ -198,6 +213,7 @@ export function _resetModuleStateForTesting() {
   sessionSaveError.value = null
   sessionDeleteError.value = null
   isSessionLoading.value = false
+  isSavingProject.value = false
   isDirty.value = false
   _podRoot = ''
   _autosaveTimer = null
@@ -1455,6 +1471,7 @@ export function useSessionIndex({ document }) {
     sessionSaveError,
     sessionDeleteError,
     isSessionLoading,
+    isSavingProject,
     isDirty,
     setPodRoot,
     loadIndex,
