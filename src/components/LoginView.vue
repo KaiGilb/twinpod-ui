@@ -10,6 +10,12 @@
   Props default to "Tom Gilb / Twin Consultant" so The Brain continues to work
   without any code changes after this upgrade.
 
+  An opt-in `embedded` prop (default false) lets a host wrapper drop this whole view
+  into its own multi-column layout over a wrapper-owned background (TheBrain Cycle 064
+  three-column login). When false the view is the original self-contained full-screen
+  gate — every consumer that omits the prop (MyNet, planguage-glossary, etc.) is
+  byte-for-byte unaffected.
+
   Spec: F.TwinPodLoginScreen — unauthenticated users see this view only.
         V.KaiIdentityConfidence — login must initiate OIDC redirect within 500ms.
         V.MobileUX — 44px min touch target on button; usable at 375px viewport.
@@ -25,6 +31,11 @@
  * @prop {string} [appTitle='Tom Gilb'] - App name displayed as the main heading.
  * @prop {string} [appSubtitle='Twin Consultant'] - Subtitle displayed below the app title.
  * @prop {string} [backgroundImage='/login-bg.jpg'] - CSS url() value for the hero background.
+ * @prop {boolean} [embedded=false] - Opt-in "bare" mode. When true the root drops its own
+ *   full-viewport hero background, dark fallback, min-height, and page padding, so a host
+ *   wrapper can place this whole login view inside its own layout (e.g. the centre column of a
+ *   multi-column page) on top of a background the wrapper owns. Default (false) is the original
+ *   self-contained full-screen gate — every consumer that omits this prop is unaffected.
  *
  * @see Spec: /Users/kaigilb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Kai-Zen-Vault/5 - Project/NoteWorld/01Planning/NoteWorld-Specs/3P.F.TwinPodLoginScreen.md
  */
@@ -44,13 +55,23 @@ const props = defineProps({
    * Default uses Vite's BASE_URL so apps deployed under a sub-path (e.g. /tomtwin/)
    * resolve the asset correctly without needing to pass the prop.
    */
-  backgroundImage: { type: String, default: `${import.meta.env.BASE_URL}login-bg.jpg` }
+  backgroundImage: { type: String, default: `${import.meta.env.BASE_URL}login-bg.jpg` },
+  /**
+   * Opt-in "bare" mode (default false → original full-screen gate, unchanged).
+   * When true, the root surrenders its own hero background + viewport sizing so a host
+   * wrapper can embed this view inside its own multi-column layout over a wrapper-owned
+   * background. The frosted-glass card stays glass — it now blurs whatever the wrapper
+   * paints behind it. See [[TheBrainLoginView]] (the only consumer that sets this today).
+   */
+  embedded: { type: Boolean, default: false }
 })
 
 // Bind background-image as an inline style so each app can supply its own asset.
-const rootStyle = computed(() => ({
-  backgroundImage: `url('${props.backgroundImage}')`
-}))
+// In embedded mode the wrapper owns the background, so we emit no inline image at all
+// (an empty style object) — the .login__root--embedded class zeroes the CSS background too.
+const rootStyle = computed(() =>
+  props.embedded ? {} : { backgroundImage: `url('${props.backgroundImage}')` }
+)
 
 // Detect whether the consumer passed any content into the `marketing` slot.
 // When the slot is empty (default for NoteWorld), the layout collapses to the
@@ -96,7 +117,10 @@ function connect(url) {
 <template>
   <main
     class="login__root"
-    :class="{ 'login__root--with-marketing': hasMarketing }"
+    :class="{
+      'login__root--with-marketing': hasMarketing,
+      'login__root--embedded': props.embedded
+    }"
     :style="rootStyle"
   >
     <div class="login__layout">
@@ -227,6 +251,21 @@ function connect(url) {
   background-position: center center;
   background-repeat: no-repeat;
   background-color: #0a1220; /* fallback while image loads */
+}
+
+/*
+ * Embedded ("bare") mode — opt-in via the `embedded` prop. The host wrapper owns the
+ * background and the page sizing, so the root becomes a transparent pass-through:
+ * no hero image, no dark fallback, no forced viewport height, no page padding. The
+ * frosted-glass card below keeps its own backdrop-filter, so it blurs whatever the
+ * wrapper paints behind it (e.g. TheBrain's holographic-brain image spanning all
+ * three columns). Default consumers never get this class — their layout is unchanged.
+ */
+.login__root--embedded {
+  min-height: auto;
+  padding: 0;
+  background-image: none;
+  background-color: transparent;
 }
 
 /*
