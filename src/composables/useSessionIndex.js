@@ -276,6 +276,19 @@ let _lastSavedContent = ''
 // per pod-root, not on every createNewSession call).
 let _rootContainerLabeled = false
 
+// _freshSessions: IDs minted by createNewSession() this session but not yet
+// persisted to content.json. syncManifestIfMigrated() skips the probe for
+// these — content.json does not exist yet so the GET would always 404,
+// logging a spurious network error in the browser console.
+// Cleared for each id on the first successful content.json write in
+// saveCurrentSession(). Cleared in full by _resetModuleStateForTesting().
+//
+// IMPORTANT: this Set is NOT _sessionMeta. _sessionMeta means "loaded this
+// session"; a loaded-not-opened Gen-3 project is absent from _sessionMeta
+// but legitimately needs the syncManifestIfMigrated probe. _freshSessions
+// only marks "created-this-session, never written to pod".
+const _freshSessions = new Set()
+
 // localStorage backup key prefix (Guard C — belt-and-suspenders safety net).
 // Every saveCurrentSession call mirrors the workbook content here under
 // the active session id. On app boot, App.vue checks for a more-recent
@@ -322,6 +335,7 @@ export function _resetModuleStateForTesting() {
   _lastSavedContent = ''
   _sessionMeta.clear()
   _rootContainerLabeled = false
+  _freshSessions.clear()
 }
 
 // Helper key for localStorage backups (Guard C).
@@ -580,8 +594,13 @@ export function useSessionIndex({ document }) {
    */
   async function syncManifestIfMigrated(id) {
     if (!_podRoot || !id) return
+    // Brand-new sessions (created this session, never persisted to content.json)
+    // are skipped entirely — the probe GET would always 404, logging a spurious
+    // browser console error. The content.json does not exist until the first
+    // saveCurrentSession() call, which also clears the id from _freshSessions.
+    if (_freshSessions.has(id)) return
     // Only sync when the project is already Gen-3 (content.json exists). Shape-check
-    // guards the TwinPod 200-not-404 quirk: a fabricated 200 without our shape is
+    // guards the TwinPod™ 200-not-404 quirk: a fabricated 200 without our shape is
     // treated as "not migrated yet".
     let migrated = false
     let contentCreated // authoritative `created` from the already-migrated content doc.
@@ -929,6 +948,12 @@ export function useSessionIndex({ document }) {
     const id = generateSessionId(name)
     const lastModified = new Date().toISOString()
 
+    // Mark as fresh — content.json has not been written yet. This suppresses
+    // the syncManifestIfMigrated content.json probe during the rename that
+    // immediately follows createNewSession() in createNewProjectWithName(),
+    // preventing a console 404 on every new project creation.
+    _freshSessions.add(id)
+
     const newEntry = { id, name, project: 'The Brain', lastModified }
     sessionList.value = [...sessionList.value, newEntry]
 
@@ -1094,6 +1119,11 @@ export function useSessionIndex({ document }) {
         sessionSaveError.value = `Could not save session file (HTTP ${fileResponse.status || 0}).`
         return
       }
+
+      // content.json is now on the pod — the session is no longer "fresh".
+      // syncManifestIfMigrated() will probe on the NEXT rename (e.g. user renames
+      // an existing project from the list) and correctly finds content.json.
+      _freshSessions.delete(id)
 
       // Write the manifest.json alongside content.json INSIDE the project folder.
       // This is what makes the folder self-contained + portable: the manifest lets a

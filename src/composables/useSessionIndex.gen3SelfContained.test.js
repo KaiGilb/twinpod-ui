@@ -322,6 +322,95 @@ describe('useSessionIndex — Cycle 066-extended DEEP self-contained project fol
     expect(mockUploadFile.mock.calls.some(([u]) => u === `${ROOT}/index.json`)).toBe(true)
   })
 
+  // BUG FIX (Cycle 066-extended, 2026-06-04) — createNewSession → renameSession
+  // must NOT probe content.json for a brand-new project. The probe would always
+  // 404 (content.json is only written on the first saveCurrentSession), logging
+  // a spurious browser console error on every new project creation.
+  //
+  // Mechanism: createNewSession() adds the new id to _freshSessions; renameSession
+  // calls syncManifestIfMigrated which early-returns when the id is in _freshSessions,
+  // never issuing the GET. No hyperFetch call expected for content.json here.
+  test('renameSession does NOT probe content.json for a brand-new (fresh) session', async () => {
+    mockHyperFetch.mockImplementation(async (url) => {
+      // An index.json load (loadIndex) may fire; everything else should be absent.
+      if (url.endsWith('/index.json')) return notFound()
+      return notFound()
+    })
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const { useSessionIndex } = await importHook()
+    const hook = useSessionIndex({ document: ref('') })
+    hook.setPodRoot(POD_ROOT)
+
+    // createNewSession() adds the id to _freshSessions.
+    await hook.createNewSession()
+    const id = hook.activeSessionId.value
+    expect(id).toBeTruthy()
+
+    vi.clearAllMocks() // reset call counts so only the rename's calls are observed.
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    // The rename must NOT probe content.json (fresh session, not yet persisted).
+    await hook.renameSession(id, 'My New Project')
+
+    const contentJsonProbes = mockHyperFetch.mock.calls
+      .filter(([u]) => u === `${ROOT}/${id}/content.json`)
+    expect(contentJsonProbes).toHaveLength(0) // no probe fired
+    // index.json IS written (live UI rename captured in the catalog).
+    expect(mockUploadFile.mock.calls.some(([u]) => u === `${ROOT}/index.json`)).toBe(true)
+  })
+
+  // After the first saveCurrentSession(), the session is no longer "fresh" —
+  // a subsequent rename DOES probe content.json (the standard Gen-3 sync path).
+  // This ensures _freshSessions.delete(id) inside saveCurrentSession() works.
+  test('renameSession probes content.json after the first saveCurrentSession()', async () => {
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+    // content.json will be present after save — simulate a hit on the probe.
+    const CONTENT = 'first saved content'
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url.endsWith('/index.json')) return notFound()
+      return notFound()
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+
+    await hook.createNewSession()
+    const id = hook.activeSessionId.value
+    expect(id).toBeTruthy()
+
+    // First save — this clears the id from _freshSessions.
+    docRef.value = CONTENT
+    hook.sessionList.value = [{ id, name: 'Temp Name', project: 'The Brain', lastModified: new Date().toISOString() }]
+    await hook.saveCurrentSession('Temp Name')
+
+    // Now the probe for the NEXT rename should fire: update the hyperFetch mock
+    // to return the content doc (content.json now exists on the pod).
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url === `${ROOT}/${id}/content.json`) return jsonResponse(contentDoc(id, CONTENT))
+      return notFound()
+    })
+    vi.clearAllMocks()
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url === `${ROOT}/${id}/content.json`) return jsonResponse(contentDoc(id, CONTENT))
+      return notFound()
+    })
+
+    await hook.renameSession(id, 'Renamed After Save')
+
+    // The probe DID fire — content.json was queried to check migration.
+    const contentJsonProbes = mockHyperFetch.mock.calls
+      .filter(([u]) => u === `${ROOT}/${id}/content.json`)
+    expect(contentJsonProbes.length).toBeGreaterThan(0)
+    // Manifest was written (project was Gen-3 migrated by the save above).
+    const manifestCall = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/${id}/manifest.json`)
+    expect(manifestCall).toBeTruthy()
+    expect(JSON.parse(manifestCall[1]).name).toBe('Renamed After Save')
+  })
+
   // RENAME-PROJECT (grouping label) also syncs the manifest's `project` for a
   // migrated project — the rebuild reconstructs `project` from the manifest.
   // Spec: criterion 2 (rebuild reads project from the manifest).
