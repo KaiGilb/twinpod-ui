@@ -3,12 +3,54 @@
 /**
  * useSessionIndex
  *
- * Manages the session index for The Brain app: a JSON file at
- * {podRoot}/home/TomTwinProjects/index.json containing session metadata,
- * and individual session .md files at {podRoot}/home/TomTwinProjects/{id}.md.
+ * Manages the projects for The Brain app, stored on the user's TwinPod pod
+ * under {podRoot}/home/TomTwinProjects/.
+ *
+ * SELF-CONTAINED PROJECT FOLDER (Gen-3, Cycle 066-extended, 2026-06-03)
+ * ---------------------------------------------------------------------
+ * Each project is ONE self-contained folder at {podRoot}/home/TomTwinProjects/<id>/
+ * holding EVERYTHING for that project, so the folder can later be moved/shared as
+ * a unit (the portable/shared-pod future). The folder contains:
+ *   - content.json  — the typed-JSON-document (schemaVersion + blocks[]); the
+ *                      project's editable content. Stable filename so a consumer
+ *                      finds it without external knowledge.
+ *   - manifest.json  — the project's own identity metadata (id, name, project,
+ *                      created, lastModified, schemaVersion, owner placeholder).
+ *                      Sufficient to reconstruct the catalog entry WITHOUT the
+ *                      user's index.json — copy <id>/ to another pod and the
+ *                      receiver reads the manifest to rebuild the entry.
+ *   - <file>         — the project's uploaded attachments (already nested here
+ *                      since Cycle 066 by the app's useDocumentUpload).
+ *
+ * The manifest is the source of truth for a project's IDENTITY. index.json is
+ * DEMOTED to a derived catalog (fast list render) — see rebuildIndexFromManifests
+ * which regenerates it by scanning the folders' manifests.
+ *
+ * Manifest design decision (separate manifest.json + content.json, not a single
+ * project.json with an embedded meta block): a small manifest makes the catalog
+ * rebuild fast — rebuild reads one tiny file per project instead of parsing each
+ * project's full (potentially large, attachment-referencing) content document.
+ * Clean separation of identity-metadata from editable-content also keeps the
+ * portable unit's "what is this project" answer cheap to read on a receiving pod.
+ *
+ * BACKWARD-COMPATIBLE TRI-GENERATIONAL READ (binding, no regression):
+ *   - Gen-3 (new): {podRoot}/home/TomTwinProjects/<id>/ (manifest + content inside).
+ *   - Gen-2 (prior production): loose {podRoot}/home/TomTwinProjects/<id>.json content
+ *     + {podRoot}/home/TomTwinProjects/<id>/ attachments + entry in index.json.
+ *   - Gen-1 (legacy): {podRoot}/home/TomTwinProjects/<id>.md (or older) +
+ *     {podRoot}/home/thebrain-sessions/index.json.
+ *   Every old project (Gen-1 and Gen-2) still lists AND opens; old attachments at
+ *   BOTH the pre-066 home/<slug>/ path and the Cycle-066 TomTwinProjects/<id>/ path
+ *   stay reachable. loadSession resolves in the order above (shape-checked).
+ *
+ * LAZY-MIGRATE-ON-SAVE (no eager bulk move): a Gen-1/Gen-2 project is persisted in
+ * the Gen-3 self-contained shape on its NEXT save (saveCurrentSession always writes
+ * <id>/content.json + <id>/manifest.json). Old loose files are left in place as
+ * historical artefacts (the established "old .md/.json filename handling" pattern).
+ * There is no migrate-everything-at-once code path.
  *
  * Storage path is governed by the single module-level constant SESSIONS_ROOT_PATH.
- * Changing the sessions storage location means editing one line — no other file
+ * Changing the projects storage location means editing one line — no other file
  * hardcodes this path string.
  *
  * Spec: 4Sol.S.TwinPodSessionIndex, 3P.F.SessionCreate, 3P.F.SessionSave,
@@ -44,6 +86,7 @@
  *   isDirty:              import('vue').Ref<boolean>,
  *   loadIndex:            () => Promise<void>,
  *   saveIndex:            () => Promise<void>,
+ *   rebuildIndexFromManifests: () => Promise<Array>,
  *   createNewSession:     () => Promise<void>,
  *   saveCurrentSession:   (name: string) => Promise<void>,
  *   loadSession:          (id: string) => Promise<string>,
@@ -110,6 +153,30 @@ const DOC_SCHEMA_VERSION = 1
 const BLOCK_KINDS = {
   markdown_text: { version: 1 }
 }
+
+// --- Gen-3 self-contained project shape (Cycle 066-extended, 2026-06-03) ---
+//
+// A project's self-contained folder holds two stable-named JSON files:
+//   <id>/content.json  — { schemaVersion, id, blocks[] }    (the editable content)
+//   <id>/manifest.json — { schemaVersion, id, name, project, created,
+//                          lastModified, owner }            (identity metadata)
+//
+// CONTENT_FILENAME / MANIFEST_FILENAME are stable + predictable so a consumer on
+// a receiving pod finds them without external knowledge (criterion 1).
+const CONTENT_FILENAME = 'content.json'
+const MANIFEST_FILENAME = 'manifest.json'
+
+// Manifest schema version — independent of the content document's schemaVersion.
+// Bump only when the manifest's own shape changes.
+const MANIFEST_SCHEMA_VERSION = 1
+
+// owner is a RESERVED provenance/owner placeholder for the future portable/shared-pod
+// direction. Cycle 066-extended ships the self-contained STRUCTURE only — the
+// New-Direction Gate for "shared pods / multiple users" was OVERRIDDEN by Kai for
+// STRUCTURE, but the multi-user value hierarchy was NOT run, so NO sharing / ACL /
+// permission / ownership-transfer LOGIC is built. This field is written as null and
+// is never read to make an access decision. A receiving pod may later populate it.
+const MANIFEST_OWNER_PLACEHOLDER = null
 
 // Module-level state so App.vue and all injected children share the same reactive refs.
 const sessionList = ref([])
@@ -408,6 +475,98 @@ export function useSessionIndex({ document }) {
     return _podRoot.replace(/\/+$/, '') + LEGACY_SESSIONS_ROOT_PATH
   }
 
+  // --- Per-project path helpers (Cycle 066-extended) ---
+  //
+  // ALL per-project URL construction goes through these four helpers — no path
+  // string is rebuilt inline. This is load-bearing for the background-save queue:
+  // enqueueWorkbookSave, switchToSession's post-restore enqueue, flushPendingSaves'
+  // drain-watch, saveCurrentSession, and deleteSession must all compute the SAME
+  // resourceKey, or a flush would never observe its save's terminal event. The
+  // queue resourceKey is the Gen-3 contentUrl(id) — the file actually written.
+
+  /** Gen-3 self-contained folder URL for a project: {root}/<id>/ (trailing slash). */
+  function folderUrl(id) {
+    return sessionsRoot() + '/' + id + '/'
+  }
+
+  /** Gen-3 content document URL: {root}/<id>/content.json. */
+  function contentUrl(id) {
+    return folderUrl(id) + CONTENT_FILENAME
+  }
+
+  /** Gen-3 manifest URL: {root}/<id>/manifest.json. */
+  function manifestUrl(id) {
+    return folderUrl(id) + MANIFEST_FILENAME
+  }
+
+  /** Gen-2 (legacy) loose content URL at the new container root: {root}/<id>.json. */
+  function looseJsonUrl(id) {
+    return sessionsRoot() + '/' + id + '.json'
+  }
+
+  /**
+   * Re-writes a project's in-folder manifest.json with the CURRENT name/project
+   * from sessionList — but ONLY for an already-migrated (Gen-3) project (one whose
+   * <id>/content.json already exists). For an un-migrated Gen-2/Gen-1 project there
+   * is no folder yet, so we skip: its next content-save migrates it with the correct
+   * name (lazy-migrate). This keeps the manifest the source of truth for identity
+   * (criterion 1) — a renamed Gen-3 project's portable folder carries the new name
+   * even if the content is never re-edited.
+   *
+   * SAFE against the rename-race that made Cycle 046 drop the body re-PUT: the
+   * manifest holds NO content `blocks`, so re-PUTting it cannot clobber an in-flight
+   * content edit. It is pure identity metadata.
+   *
+   * Best-effort + non-blocking: a failure surfaces on sessionSaveError but does not
+   * throw (the index.json write already captured the rename for the live UI).
+   * @param {string} id - Session ID.
+   * @returns {Promise<void>}
+   */
+  async function syncManifestIfMigrated(id) {
+    if (!_podRoot || !id) return
+    // Only sync when the project is already Gen-3 (content.json exists). Shape-check
+    // guards the TwinPod 200-not-404 quirk: a fabricated 200 without our shape is
+    // treated as "not migrated yet".
+    let migrated = false
+    let contentCreated // authoritative `created` from the already-migrated content doc.
+    try {
+      const probe = await ur.hyperFetch(contentUrl(id), {
+        method: 'GET',
+        headers: { accept: 'application/json' }
+      })
+      if (probe.ok) {
+        try {
+          const p = JSON.parse(await probe.text())
+          migrated = typeof p.schemaVersion === 'number' && Array.isArray(p.blocks)
+          if (migrated && typeof p.created === 'string') contentCreated = p.created
+        } catch { migrated = false }
+      }
+    } catch { return } // network blip — leave the manifest for the next content save.
+    if (!migrated) return
+
+    const entry = sessionList.value.find(s => s.id === id)
+    if (!entry) return
+    // `created` is preserved, NOT regenerated. Prefer the content doc's created
+    // (authoritative, just read above) so a rename-from-list of a project NOT opened
+    // this session does not overwrite the manifest's created with now() —
+    // `_sessionMeta` is only seeded by loadSession/saveCurrentSession, never loadIndex,
+    // and `entry.lastModified` was just set to now() by the optimistic rename update.
+    const created = contentCreated ?? _sessionMeta.get(id)?.created ?? entry.lastModified ?? new Date().toISOString()
+    const manifest = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION,
+      id,
+      name: entry.name,
+      project: entry.project ?? 'The Brain',
+      created,
+      lastModified: entry.lastModified ?? new Date().toISOString(),
+      owner: MANIFEST_OWNER_PLACEHOLDER
+    }
+    const res = await ur.uploadFile(manifestUrl(id), JSON.stringify(manifest), 'application/json')
+    if (!res.ok) {
+      sessionSaveError.value = `Renamed, but could not update the project manifest (HTTP ${res.status || 0}).`
+    }
+  }
+
   // --- Container materialization: write-path-only idiom (Cycle 066, 2026-06-03) ---
   //
   // We deliberately do NOT pre-create the TomTwinProjects container with a
@@ -573,6 +732,13 @@ export function useSessionIndex({ document }) {
   /**
    * Writes the current sessionList to index.json on the pod.
    *
+   * DERIVED CATALOG (Cycle 066-extended): index.json is no longer the source of
+   * truth for a project's identity — each project's in-folder manifest.json is.
+   * index.json is still written on every save as a fast list-render cache (and the
+   * dual-read/merge backward-compat path depends on it), but a lost/corrupt
+   * index.json can be regenerated from the per-folder manifests via
+   * rebuildIndexFromManifests().
+   *
    * Uses ur.uploadFile to PUT JSON via the authenticated session.
    * Content-Type: application/json.
    *
@@ -589,6 +755,94 @@ export function useSessionIndex({ document }) {
     if (!response.ok) {
       sessionSaveError.value = `Could not save session index (HTTP ${response.status || 0}).`
     }
+  }
+
+  /**
+   * Rebuilds the project catalog by scanning the self-contained project folders'
+   * manifests — the recovery path for a lost/missing/corrupt index.json
+   * (criterion 2). Proves the manifest, not index.json, is the source of truth for
+   * a project's identity: each Gen-3 folder reconstructs its own catalog entry.
+   *
+   * Algorithm:
+   *   1. ur.listContainer({root}/) → child URIs. LDP marks containers (folders)
+   *      with a trailing slash; loose files ({id}.json, {id}.md, index.json) do not.
+   *      We keep only the trailing-slash children = the per-project Gen-3 folders.
+   *   2. For each folder, GET <folder>manifest.json and shape-check it (id string +
+   *      created string + NO blocks — distinguishes a manifest from a content doc
+   *      under the TwinPod 200-not-404 quirk).
+   *   3. Reconstruct the catalog entry { id, name, project, lastModified } from the
+   *      manifest. De-dupe on id (a folder's manifest wins; defensive only — one
+   *      folder per id).
+   *
+   * Scope/limitation (documented, not silent): manifest-rebuild recovers ONLY
+   * migrated Gen-3 projects (they alone have a manifest). Un-migrated Gen-2 loose
+   * {id}.json and Gen-1 {id}.md projects have no manifest and are NOT recovered by
+   * this scan — they still rely on a present index.json (the normal path) and
+   * lazy-migrate into Gen-3 on their next save. This is acceptable: rebuild is a
+   * recovery path, and index.json is written on every save.
+   *
+   * Does NOT overwrite sessionList or write index.json itself — it RETURNS the
+   * reconstructed entries so the caller decides what to do (inspect, then optionally
+   * assign to sessionList + saveIndex()). This keeps a pure, testable rebuild.
+   *
+   * Spec: 4Sol.S.TwinPodProjectIndex — index.json is a derived catalog rebuildable
+   * from the per-folder manifests.
+   * @returns {Promise<Array<{id:string,name:string,project:string,lastModified:string}>>}
+   */
+  async function rebuildIndexFromManifests() {
+    if (!_podRoot) return []
+
+    const rootUrl = sessionsRoot() + '/'
+    let children = []
+    try {
+      children = await ur.listContainer(rootUrl)
+    } catch {
+      // Container missing / unreadable → nothing to rebuild from.
+      return []
+    }
+
+    // Keep only sub-CONTAINERS (trailing slash per LDP) — the per-project folders.
+    const folderUrls = (children || []).filter(u => typeof u === 'string' && u.endsWith('/'))
+
+    const byId = new Map()
+    for (const folder of folderUrls) {
+      const mUrl = folder + MANIFEST_FILENAME
+      let response
+      try {
+        response = await ur.hyperFetch(mUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' }
+        })
+      } catch {
+        continue // network blip on one folder — skip it, keep scanning the rest.
+      }
+      if (!response || !response.ok) continue
+      let parsed
+      try {
+        parsed = JSON.parse(await response.text())
+      } catch {
+        continue // Turtle-for-.json / non-JSON body → not a manifest.
+      }
+      // Manifest shape: id (string) + created (string) AND NO blocks array — the
+      // latter distinguishes a manifest from a content doc returned by a fabricated
+      // 200 (TwinPod 200-not-404 quirk).
+      const isManifest =
+        typeof parsed.id === 'string' &&
+        typeof parsed.created === 'string' &&
+        !Array.isArray(parsed.blocks)
+      if (!isManifest) continue
+
+      byId.set(parsed.id, {
+        id: parsed.id,
+        name: typeof parsed.name === 'string' ? parsed.name : parsed.id,
+        project: typeof parsed.project === 'string' ? parsed.project : 'The Brain',
+        lastModified: typeof parsed.lastModified === 'string'
+          ? parsed.lastModified
+          : (parsed.created ?? new Date().toISOString())
+      })
+    }
+
+    return Array.from(byId.values())
   }
 
   /**
@@ -661,11 +915,15 @@ export function useSessionIndex({ document }) {
     isDirty.value = false
 
     const id = activeSessionId.value
-    // Spec: 4Sol.S.TwinPodSessionIndex (revised 2026-05-10) — session file is written
-    // as a typed-JSON-document at {id}.json (extension matches the content honestly).
-    // The legacy {id}.md file (if any) is NOT deleted on legacy → new conversion; it
-    // remains as a historical artifact on the pod per spec "Old .md filename handling".
-    const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+    // Gen-3 self-contained shape (Cycle 066-extended): the project's content is
+    // written to {root}/<id>/content.json and its identity metadata to
+    // {root}/<id>/manifest.json — both INSIDE the project's own folder. This is the
+    // ALWAYS-write target, so it doubles as lazy-migrate-on-save: a Gen-1/Gen-2
+    // project saved here lands in the Gen-3 shape with NO special migration branch.
+    // The legacy loose {id}.json / {id}.md files (if any) are NOT deleted — they
+    // remain as historical artefacts per the established "old filename handling".
+    const sessionFileUrl = contentUrl(id)
+    const sessionManifestUrl = manifestUrl(id)
 
     // Rename-race fix (Cycle 047, 2026-05-23): resolve `name` from sessionList
     // at PUT-time rather than trusting the `name` parameter captured at enqueue
@@ -699,6 +957,10 @@ export function useSessionIndex({ document }) {
     _writeLocalStorageBackup(id, document.value ?? '')
 
     const blockId = `${id}-block-1`
+    // content.json — the typed-JSON-document. Shape is unchanged from the prior
+    // loose {id}.json (schemaVersion + blocks, plus the mirrored identity fields)
+    // so it is a drop-in for the Gen-2 file and the existing loadSession shape-check
+    // (schemaVersion number + blocks array) works on it verbatim.
     const sessionDoc = {
       schemaVersion: DOC_SCHEMA_VERSION,
       id,
@@ -716,6 +978,23 @@ export function useSessionIndex({ document }) {
       ]
     }
     const body = JSON.stringify(sessionDoc)
+
+    // manifest.json — the project's IDENTITY metadata, sufficient to reconstruct
+    // this project's index.json catalog entry WITHOUT the user's index.json
+    // (criterion 1 + 2). Includes `project` (the grouping label) because the
+    // catalog entry is { id, name, project, lastModified } — omitting it would make
+    // a rebuilt entry invalid. `owner` is the reserved provenance placeholder
+    // (null, no logic — New-Direction-Gate structure-only boundary).
+    const manifest = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION,
+      id,
+      name: resolvedName,
+      project,
+      created,
+      lastModified: nowIso,
+      owner: MANIFEST_OWNER_PLACEHOLDER
+    }
+    const manifestBody = JSON.stringify(manifest)
 
     // ──────────────────────────────────────────────────────────────────────────
     // Cycle 045 (iter-2, 2026-05-21) — bare-file PUT with transparent versioning.
@@ -751,8 +1030,22 @@ export function useSessionIndex({ document }) {
         return
       }
 
+      // Write the manifest.json alongside content.json INSIDE the project folder.
+      // This is what makes the folder self-contained + portable: the manifest lets a
+      // receiving pod rebuild this project's catalog entry without the user's
+      // index.json. It is written AFTER the content PUT succeeds (the content is the
+      // user's work and gates isDirty; the manifest is derived identity metadata). A
+      // manifest write that fails does NOT restore isDirty — the content is safe and
+      // the next save re-PUTs the manifest — but the failure is surfaced so it is not
+      // silent. The deep-path PUT auto-materializes the <id>/ container (write-path-
+      // only idiom); writing content first means the folder already exists here.
+      const manifestResponse = await ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json')
+      if (!manifestResponse.ok) {
+        sessionSaveError.value = `Saved content, but could not save project manifest (HTTP ${manifestResponse.status || 0}).`
+      }
+
       // Successful save — update meta. Clear the legacy-loaded flag so future loads
-      // skip the .md fallback once the new .json exists.
+      // resolve from the Gen-3 folder rather than the legacy loose-file fallback.
       _sessionMeta.set(id, { created, legacyLoaded: false })
 
       // Update the index entry — lastModified only. `name` is owned by
@@ -790,13 +1083,17 @@ export function useSessionIndex({ document }) {
   }
 
   /**
-   * Fetches the session file for `id` and returns its markdown content as a string.
+   * Fetches the project's content for `id` and returns its markdown text as a string.
    *
-   * Spec: 4Sol.S.TwinPodSessionIndex (revised 2026-05-10) — read path tries {id}.json
-   * first (new typed-JSON-document shape). On 404, falls back to {id}.md, which may
-   * hold either the legacy JSON-in-.md shape or the older text+YAML-frontmatter shape.
-   * On legacy load, the legacy file is NOT rewritten; the user's next save persists
-   * in the new .json shape (auto-convert at next save).
+   * TRI-GENERATIONAL READ (Cycle 066-extended) — resolves in this order, shape-checked
+   * at each step (binding, no regression — every old project must still open):
+   *   1. Gen-3: {root}/<id>/content.json  (self-contained folder — the new shape)
+   *   2. Gen-2: loose {root}/<id>.json    (prior production typed-JSON-document)
+   *   3. Gen-1: {root}/<id>.md            (new container, brief intermediate state)
+   *   4. Gen-1: legacy {legacyRoot}/<id>.md (pre-Cycle-021 production location)
+   * Old files are never rewritten on read; the user's next save persists in the Gen-3
+   * shape (lazy-migrate-on-save). The .md shapes carry the legacy JSON-in-.md or
+   * text+YAML-frontmatter body.
    *
    * For the bootstrap increment (TypedJSONDocSessionFormat) only the markdown text of
    * the first block is returned, so the workspace ref stays a plain string. Future
@@ -809,40 +1106,51 @@ export function useSessionIndex({ document }) {
   async function loadSession(id) {
     if (!_podRoot || !id) return ''
 
-    // --- Try {id}.json first (new typed-JSON-document shape) ---
-    const jsonUrl = sessionsRoot() + '/' + id + '.json'
-    const jsonResponse = await ur.hyperFetch(jsonUrl, {
-      method: 'GET',
-      headers: { accept: 'application/json' }
-    })
-
-    if (jsonResponse.ok) {
-      // MIME-negotiation gotcha (curated memory pod-json-read-write.md): in principle
-      // ur.hyperFetch can return Turtle for a .json file if the server matches text/turtle
-      // first. We send `accept: application/json` (mirrors loadIndex pattern, which works
-      // empirically) and shape-check the parsed body below — non-JSON or non-matching
-      // shape falls through to the .md fallback rather than crashing.
-      const text = await jsonResponse.text()
-      try {
-        const parsed = JSON.parse(text)
-        // New typed-JSON-document: has schemaVersion AND blocks array.
-        if (typeof parsed.schemaVersion === 'number' && Array.isArray(parsed.blocks)) {
-          _sessionMeta.set(id, { created: parsed.created, legacyLoaded: false })
-          // Extract markdown from the first markdown_text block (bootstrap single-block).
-          const firstMarkdown = parsed.blocks.find(b => b?.kind === 'markdown_text')
-          return typeof firstMarkdown?.text === 'string' ? firstMarkdown.text : ''
+    // Reads a typed-JSON-document content file (Gen-3 content.json or Gen-2 loose
+    // {id}.json — identical shape). Returns one of:
+    //   { kind: 'hit',     text }    — shape matched; this is the content.
+    //   { kind: 'miss' }              — 404, or a 200 whose body is not a content doc
+    //                                   (TwinPod 200-not-404 / Turtle-for-.json quirk).
+    //                                   Caller falls through to the next generation.
+    //   throws                        — a real (non-404) HTTP error.
+    // MIME-negotiation gotcha (curated memory pod-json-read-write.md): hyperFetch can
+    // return Turtle for a .json URL; we send `accept: application/json` (mirrors
+    // loadIndex, which works empirically) and shape-check before trusting the body.
+    async function tryLoadContentJson(url) {
+      const response = await ur.hyperFetch(url, {
+        method: 'GET',
+        headers: { accept: 'application/json' }
+      })
+      if (response.ok) {
+        const text = await response.text()
+        try {
+          const parsed = JSON.parse(text)
+          // Content document shape: schemaVersion (number) AND blocks (array).
+          if (typeof parsed.schemaVersion === 'number' && Array.isArray(parsed.blocks)) {
+            _sessionMeta.set(id, { created: parsed.created, legacyLoaded: false })
+            const firstMarkdown = parsed.blocks.find(b => b?.kind === 'markdown_text')
+            return { kind: 'hit', text: typeof firstMarkdown?.text === 'string' ? firstMarkdown.text : '' }
+          }
+          // Parsed but not a content doc (fabricated 200 / different shape) → miss.
+          return { kind: 'miss' }
+        } catch {
+          // Body wasn't JSON (e.g. Turtle despite the .json URL) → miss, fall through.
+          return { kind: 'miss' }
         }
-        // Body parsed but shape doesn't match new doc — treat as "no real saved session"
-        // (matches the TwinPod 200-not-404 fabricated-response quirk).
-        return ''
-      } catch {
-        // Body wasn't JSON at all (e.g. server returned Turtle despite the .json URL).
-        // Fall through to the legacy .md path below.
       }
-    } else if (jsonResponse.status !== 404) {
-      // Real HTTP error on the .json GET — propagate.
-      throw new Error(`Could not load session (HTTP ${jsonResponse.status}).`)
+      if (response.status !== 404) {
+        throw new Error(`Could not load session (HTTP ${response.status}).`)
+      }
+      return { kind: 'miss' }
     }
+
+    // --- Gen-3: {root}/<id>/content.json (self-contained folder) ---
+    const gen3 = await tryLoadContentJson(contentUrl(id))
+    if (gen3.kind === 'hit') return gen3.text
+
+    // --- Gen-2: loose {root}/<id>.json (prior production typed-JSON-document) ---
+    const gen2 = await tryLoadContentJson(looseJsonUrl(id))
+    if (gen2.kind === 'hit') return gen2.text
 
     // --- Fallback chain: try {id}.md at the new path, then at the legacy path. ---
     //
@@ -974,7 +1282,11 @@ export function useSessionIndex({ document }) {
           // the same key, no race. If offline, the task fails per existing
           // semantics (backup retained, isDirty=true).
           if (_podRoot) {
-            const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+            // Queue resourceKey is the Gen-3 contentUrl — the file actually written
+            // by saveCurrentSession. MUST match the key used by enqueueWorkbookSave
+            // and watched by flushPendingSaves, or a flush would never see this
+            // save's terminal event (Cycle 066-extended path centralisation).
+            const sessionFileUrl = contentUrl(id)
             const sessionName = sessionList.value.find(s => s.id === id)?.name
               ?? 'Session'
             // _writeLocalStorageBackup is already current (the restore just
@@ -1000,7 +1312,8 @@ export function useSessionIndex({ document }) {
   // --- Rename helpers ---
 
   /**
-   * Renames a session (updates name in index.json and in the session's .md frontmatter).
+   * Renames a session (updates name in index.json and, for an already-migrated
+   * Gen-3 project, in the in-folder manifest.json).
    *
    * Spec: 3P.F.SessionRename
    * @param {string} id - Session ID to rename.
@@ -1019,14 +1332,14 @@ export function useSessionIndex({ document }) {
     // Persist updated index.
     await saveIndex()
 
-    // Path 9 DROPPED (Cycle 046, 2026-05-23) — rename no longer GETs +
-    // re-PUTs the session body to update its embedded `name` field. The
-    // body's `session_name` becomes stale until the next autosave writes
-    // it, which is acceptable: the panel shows the index entry's `name`
-    // (authoritative), not the body's. Dropping the in-band body PATCH
-    // removes the "rename drops in-flight edits" failure mode (rename
-    // racing against a queued autosave of the body would clobber the
-    // in-flight content).
+    // Keep the in-folder manifest's name in sync for an already-migrated (Gen-3)
+    // project, so the portable folder carries the new name even if the content is
+    // never re-edited (criterion 1 — manifest is the source of truth for identity).
+    // No-op for un-migrated Gen-2/Gen-1 (their next content-save migrates with the
+    // correct name). The manifest holds NO content blocks, so this is safe from the
+    // Cycle-046 rename-race that made the BODY re-PUT get dropped (Path 9): we never
+    // re-PUT the content body on rename — only the small identity manifest.
+    await syncManifestIfMigrated(id)
   }
 
   /**
@@ -1049,8 +1362,12 @@ export function useSessionIndex({ document }) {
       s.id === id ? { ...s, project: trimmed } : s
     )
 
-    // Spec: 4Sol.S.TwinPodSessionIndex — only index.json is written on project label change.
+    // Spec: 4Sol.S.TwinPodSessionIndex — index.json is written on project label change.
     await saveIndex()
+    // Keep the in-folder manifest's `project` (grouping label) in sync for an
+    // already-migrated Gen-3 project — the rebuild reconstructs the catalog entry's
+    // project from the manifest, so a stale manifest project would defeat criterion 2.
+    await syncManifestIfMigrated(id)
   }
 
   // --- Delete ---
@@ -1108,33 +1425,39 @@ export function useSessionIndex({ document }) {
     // Persist the updated index.
     await saveIndex()
 
-    // Best-effort: delete the session file(s) from the pod. We try BOTH the new
-    // {id}.json (current write target) and the legacy {id}.md (historical artifact
-    // that may still exist for sessions created before the typed-JSON-document
-    // format). 404 / 405 / network errors on either are acceptable — the index has
-    // already been updated and is the authoritative session list.
+    // Best-effort: delete the project's identity files from the pod across all
+    // generations. 404 / 405 / network errors on any are acceptable — the index has
+    // already been updated and is the authoritative project list. We delete the
+    // Gen-3 in-folder content.json + manifest.json, the Gen-2 loose {id}.json, and
+    // the Gen-1 {id}.md. We do NOT delete the {id}/ container itself nor the user's
+    // uploaded attachments inside it — removing user attachments is out of scope for
+    // a project delete, and a non-empty-container DELETE would 405 anyway.
     //
     // BareFileSave 2026-05-23: switched from raw ur.hyperFetch DELETE (which left
     // local rdfStore stale and silently swallowed all errors) to ur.deleteURI —
     // canonical primitive that DELETEs on the server AND prunes both directions
     // of rdfStore (`(*, *, uri)` and `(uri, *, *)`). Failures emit a console.warn
     // and surface on sessionDeleteError (non-blocking) per the brief.
-    const jsonUrl = sessionsRoot() + '/' + id + '.json'
-    const mdUrl = sessionsRoot() + '/' + id + '.md'
+    const gen3ContentUrl = contentUrl(id)   // Gen-3 in-folder content.
+    const gen3ManifestUrl = manifestUrl(id) // Gen-3 in-folder manifest.
+    const jsonUrl = looseJsonUrl(id)        // Gen-2 loose {id}.json.
+    const mdUrl = sessionsRoot() + '/' + id + '.md' // Gen-1 {id}.md (historical).
     sessionDeleteError.value = null
     try {
-      const okJson = await ur.deleteURI(jsonUrl)
-      if (!okJson) console.warn('[useSessionIndex] deleteURI returned false for', jsonUrl)
+      const okContent = await ur.deleteURI(gen3ContentUrl)
+      if (!okContent) console.warn('[useSessionIndex] deleteURI returned false for', gen3ContentUrl)
     } catch (err) {
-      console.warn('[useSessionIndex] deleteURI threw for', jsonUrl, err?.message || err)
-      sessionDeleteError.value = `Could not delete session file (${err?.message || 'unknown error'})`
+      console.warn('[useSessionIndex] deleteURI threw for', gen3ContentUrl, err?.message || err)
+      sessionDeleteError.value = `Could not delete project content (${err?.message || 'unknown error'})`
     }
-    try {
-      // ur.deleteURI returns false for 404, which is the expected case for sessions
-      // that never had a .md companion file. Don't warn on that.
-      await ur.deleteURI(mdUrl)
-    } catch (err) {
-      console.warn('[useSessionIndex] deleteURI threw for legacy', mdUrl, err?.message || err)
+    // The remaining three are historical/derived artefacts — 404 is the expected
+    // case for any a given project never had. Don't warn on a false (404) return.
+    for (const url of [gen3ManifestUrl, jsonUrl, mdUrl]) {
+      try {
+        await ur.deleteURI(url)
+      } catch (err) {
+        console.warn('[useSessionIndex] deleteURI threw for', url, err?.message || err)
+      }
     }
   }
 
@@ -1275,7 +1598,9 @@ export function useSessionIndex({ document }) {
     // will also re-write the backup right before the network call, but
     // doing it here makes the close-while-queued window safe too.
     _writeLocalStorageBackup(id, document.value ?? '')
-    const sessionFileUrl = sessionsRoot() + '/' + id + '.json'
+    // Queue resourceKey is the Gen-3 contentUrl — the file saveCurrentSession
+    // actually PUTs. Same key as the post-restore enqueue and the flush drain-watch.
+    const sessionFileUrl = contentUrl(id)
     return ur.enqueueSave({
       resourceKey: sessionFileUrl,
       label: 'workbook-save',
@@ -1333,7 +1658,9 @@ export function useSessionIndex({ document }) {
     //    If we did NOT enqueue (no-op flush) but a prior autosave is in
     //    flight, watch for any in-flight task on our resourceKey and wait
     //    for its terminal event. Otherwise resolve immediately.
-    const sessionFileUrl = sessionsRoot() + '/' + activeSessionId.value + '.json'
+    //    resourceKey MUST equal the contentUrl used by enqueueWorkbookSave —
+    //    a mismatch here would make the drain-watch never observe completion.
+    const sessionFileUrl = contentUrl(activeSessionId.value)
     return await new Promise((resolve) => {
       let settled = false
       let watchedJobId = jobId
@@ -1489,6 +1816,7 @@ export function useSessionIndex({ document }) {
     setPodRoot,
     loadIndex,
     saveIndex,
+    rebuildIndexFromManifests,
     createNewSession,
     saveCurrentSession,
     saveActiveSession,

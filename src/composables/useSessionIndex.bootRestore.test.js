@@ -175,10 +175,11 @@ describe('useSessionIndex switchToSession — Guard C boot-restore (Cycle 048 re
     expect(result).toEqual({ restored: true })
 
     // Post-restore enqueue: a save MUST have been scheduled against the
-    // session JSON resourceKey so the pod catches up the moment the
-    // network is back.
+    // session content resourceKey so the pod catches up the moment the
+    // network is back. Cycle 066-extended: the queue resourceKey is the Gen-3
+    // content path {root}/<id>/content.json (the file saveCurrentSession PUTs).
     expect(mockEnqueueSave).toHaveBeenCalled()
-    const expectedResourceKey = `${POD_ROOT.replace(/\/+$/, '')}/home/TomTwinProjects/${SESSION_ID}.json`
+    const expectedResourceKey = `${POD_ROOT.replace(/\/+$/, '')}/home/TomTwinProjects/${SESSION_ID}/content.json`
     const enqueuedKeys = mockEnqueueSave.mock.calls.map(([opts]) => opts.resourceKey)
     expect(enqueuedKeys).toContain(expectedResourceKey)
   })

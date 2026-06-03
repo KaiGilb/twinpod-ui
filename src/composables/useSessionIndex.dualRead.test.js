@@ -165,10 +165,11 @@ describe('useSessionIndex — Cycle 066 TomTwinProjects + dual-read', () => {
     expect(content).toBe(LEGACY_CONTENT)
   })
 
-  // Criterion 2 — a NEW project's body writes to /home/TomTwinProjects/<id>.json
-  // in a single path-write (uploadFile), NOT to the legacy path.
-  // Spec: Cycle 066 acceptance criterion 2 + write path.
-  test('saveCurrentSession writes the new project under TomTwinProjects in one PUT', async () => {
+  // Criterion 2 — a NEW project writes the Gen-3 self-contained shape:
+  // content.json + manifest.json INSIDE /home/TomTwinProjects/<id>/, NOT to the
+  // legacy path and NOT as a loose /home/TomTwinProjects/<id>.json.
+  // Spec: Cycle 066-extended acceptance criteria 1–2 + write path.
+  test('saveCurrentSession writes the Gen-3 self-contained shape (content + manifest inside <id>/)', async () => {
     const id = 'fresh-proj-9xyz'
     mockHyperFetch.mockImplementation(async () => notFound())
     const { useSessionIndex } = await importHook()
@@ -180,12 +181,48 @@ describe('useSessionIndex — Cycle 066 TomTwinProjects + dual-read', () => {
 
     await hook.saveCurrentSession('Fresh')
 
-    // Two PUTs expected: {id}.json (body) + index.json — both under TomTwinProjects.
     const putUrls = mockUploadFile.mock.calls.map(([u]) => u)
-    expect(putUrls).toContain(`${NEW_ROOT}/${id}.json`)
+    // Content + manifest BOTH land inside the self-contained folder <id>/.
+    expect(putUrls).toContain(`${NEW_ROOT}/${id}/content.json`)
+    expect(putUrls).toContain(`${NEW_ROOT}/${id}/manifest.json`)
+    // index.json is still written (derived catalog) for the fast list path.
     expect(putUrls).toContain(`${NEW_ROOT}/index.json`)
+    // NO loose {id}.json at the TomTwinProjects level for new projects.
+    expect(putUrls).not.toContain(`${NEW_ROOT}/${id}.json`)
     // No write ever targets the legacy container (no eager migrate-write).
     expect(putUrls.every(u => !u.startsWith(LEGACY_ROOT))).toBe(true)
+  })
+
+  // Manifest content — reconstructs the catalog entry WITHOUT index.json and
+  // carries the reserved owner placeholder (structure-only; no sharing logic).
+  // Spec: Cycle 066-extended criterion 1 (manifest carries id/name/project/created/
+  // lastModified/schemaVersion + provenance placeholder).
+  test('manifest.json carries full identity metadata + null owner placeholder', async () => {
+    const id = 'manifest-proj-5kkk'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    const { useSessionIndex } = await importHook()
+    const hook = useSessionIndex({ document: ref('hello') })
+    hook.setPodRoot(POD_ROOT)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: 'Manifest Proj', project: 'NoteWorld', lastModified: '2026-06-03T00:00:00.000Z' }]
+
+    await hook.saveCurrentSession('Manifest Proj')
+
+    const manifestCall = mockUploadFile.mock.calls.find(([u]) => u === `${NEW_ROOT}/${id}/manifest.json`)
+    expect(manifestCall).toBeTruthy()
+    const manifest = JSON.parse(manifestCall[1])
+    expect(manifest.id).toBe(id)
+    expect(manifest.name).toBe('Manifest Proj')
+    expect(manifest.project).toBe('NoteWorld')          // grouping label preserved for rebuild
+    expect(typeof manifest.created).toBe('string')
+    expect(typeof manifest.lastModified).toBe('string')
+    expect(typeof manifest.schemaVersion).toBe('number')
+    expect(manifest.owner).toBeNull()                    // reserved placeholder, no logic
+    // The content document does NOT carry the loose-file at <id>.json; it is inside <id>/.
+    const contentCall = mockUploadFile.mock.calls.find(([u]) => u === `${NEW_ROOT}/${id}/content.json`)
+    const content = JSON.parse(contentCall[1])
+    expect(Array.isArray(content.blocks)).toBe(true)
+    expect(typeof content.schemaVersion).toBe('number')
   })
 
   // No orphaning — id present in BOTH indexes appears exactly once (new wins),
