@@ -29,6 +29,7 @@ import { ref } from 'vue'
 // --- ur mock (mirrors bootRestore.test.js shape) ---
 const mockHyperFetch = vi.fn()
 const mockUploadFile = vi.fn()
+const mockPatchInsert = vi.fn().mockResolvedValue(undefined)
 const mockEnsureContainer = vi.fn().mockResolvedValue(undefined)
 const mockEnqueueSave = vi.fn()
 const mockDeleteURI = vi.fn().mockResolvedValue(true)
@@ -38,6 +39,7 @@ vi.mock('@kaigilb/twinpod-client', () => ({
   ur: {
     hyperFetch: mockHyperFetch,
     uploadFile: mockUploadFile,
+    patchInsert: mockPatchInsert,
     ensureContainer: mockEnsureContainer,
     enqueueSave: mockEnqueueSave,
     deleteURI: mockDeleteURI,

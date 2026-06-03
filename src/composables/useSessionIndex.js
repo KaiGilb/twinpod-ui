@@ -249,6 +249,33 @@ let _lastSavedContent = ''
 // redirect saves go through ensureSessionSaved (Guard B) which awaits
 // saveCurrentSession directly without needing a timer ref.
 
+// --- Container label tracking (Cycle 066-extended, 2026-06-04) ---
+//
+// The TomTwinProjects container (and each <id>/ project folder) is
+// auto-materialized by a plain file PUT with no rdfs:label triple, so the
+// LaunchPad's getLabel() falls through to the uri4uri:path branch and renders
+// the array-coercion comma bug (",TomTwinProjects").
+//
+// We attempt a best-effort sparql-update PATCH to set rdfs:label on both the
+// root container and each project folder immediately after they materialize.
+// This is FIRE-AND-FORGET: failures are logged as warnings but NEVER block
+// the save path. The app functions correctly regardless — label-set is a
+// cosmetic improvement for pod browsing only.
+//
+// Prior diagnosis (2026-06-03, tst-plan.twinpod.eu, Reference_Code_TwinPod-
+// DefaultContainers-quirks.md): sparql-update PATCH to a container slash URL
+// returns 401 (wrong endpoint); /node/Substance INSERT succeeds (201) but
+// the triple does not durably persist on cold reads. Both are confirmed on
+// tst-plan; behavior on demo.systemtwin.com may differ — the hook is in
+// place so that if/when the server path works the label lands automatically.
+// FRED-LAUNCHPAD-LABEL-1 (the LaunchPad getLabel array-join fix) is the
+// durable fix; this client-side hook is defense-in-depth.
+//
+// _rootContainerLabeled: tracks whether we have already attempted the
+// one-time label set for the TomTwinProjects root container (attempt once
+// per pod-root, not on every createNewSession call).
+let _rootContainerLabeled = false
+
 // localStorage backup key prefix (Guard C — belt-and-suspenders safety net).
 // Every saveCurrentSession call mirrors the workbook content here under
 // the active session id. On app boot, App.vue checks for a more-recent
@@ -294,6 +321,7 @@ export function _resetModuleStateForTesting() {
   _autosaveTimer = null
   _lastSavedContent = ''
   _sessionMeta.clear()
+  _rootContainerLabeled = false
 }
 
 // Helper key for localStorage backups (Guard C).
@@ -454,6 +482,34 @@ export function _clearScratchDraft() {
 export function useSessionIndex({ document }) {
 
   // --- Internal helpers ---
+
+  /**
+   * Best-effort fire-and-forget sparql-update PATCH to set rdfs:label on a
+   * container. NEVER throws. NEVER blocks the caller. Logs a warning on failure.
+   *
+   * Per the Writes standard §1.1: "data ABOUT an existing resource" targets the
+   * resource URI directly. The SPARQL INSERT DATA body uses a fully-qualified
+   * rdfs:label predicate so no @prefix declaration is needed inside INSERT DATA.
+   *
+   * Prior diagnosis (2026-06-03): this path returns 401 on tst-plan.twinpod.eu.
+   * The hook is in place for when/if the server path is opened; it never blocks
+   * the write path on failure. See _rootContainerLabeled comment above.
+   *
+   * @param {string} containerUrl - Container URL (trailing slash), e.g. {root}/
+   * @param {string} label        - Human-readable display label string.
+   * @returns {Promise<void>}
+   */
+  async function _setContainerLabel(containerUrl, label) {
+    if (!containerUrl || !label) return
+    try {
+      await ur.patchInsert(
+        containerUrl,
+        `INSERT DATA {\n  <${containerUrl}> <http://www.w3.org/2000/01/rdf-schema#label> "${label.replace(/"/g, '\\"')}" .\n}`
+      )
+    } catch (err) {
+      console.warn('[useSessionIndex] container label-set failed (best-effort):', containerUrl, err?.message || err)
+    }
+  }
 
   /**
    * Returns the sessions container URL for the current pod.
@@ -887,6 +943,15 @@ export function useSessionIndex({ document }) {
     _lastSavedContent = ''
 
     await saveIndex()
+
+    // Best-effort: set rdfs:label on the TomTwinProjects root container so the
+    // LaunchPad renders it without the leading-comma uri4uri:path fallback.
+    // Fire-and-forget — runs after saveIndex() (which materialized the container).
+    // Attempted ONCE per pod-root per session. Never blocks.
+    if (!_rootContainerLabeled && _podRoot) {
+      _rootContainerLabeled = true
+      _setContainerLabel(sessionsRoot() + '/', 'TomTwinProjects')
+    }
   }
 
   /**
@@ -1042,6 +1107,16 @@ export function useSessionIndex({ document }) {
       const manifestResponse = await ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json')
       if (!manifestResponse.ok) {
         sessionSaveError.value = `Saved content, but could not save project manifest (HTTP ${manifestResponse.status || 0}).`
+      }
+
+      // Best-effort: set rdfs:label on the project's <id>/ container so the
+      // LaunchPad renders the project name instead of the comma-prefixed path.
+      // Fire-and-forget — the folder was auto-materialized by the content PUT above.
+      // Only attempted on the FIRST save for this session (when _sessionMeta has no
+      // prior entry). Subsequent saves skip the label-set (already attempted).
+      // Never blocks the save path on failure.
+      if (!_sessionMeta.has(id)) {
+        _setContainerLabel(folderUrl(id), resolvedName)
       }
 
       // Successful save — update meta. Clear the legacy-loaded flag so future loads

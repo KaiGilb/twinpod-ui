@@ -24,6 +24,7 @@ import { ref } from 'vue'
 
 const mockHyperFetch = vi.fn()
 const mockUploadFile = vi.fn()
+const mockPatchInsert = vi.fn().mockResolvedValue(undefined)
 const mockListContainer = vi.fn()
 const mockEnsureContainer = vi.fn().mockResolvedValue(undefined)
 const mockEnqueueSave = vi.fn()
@@ -34,6 +35,7 @@ vi.mock('@kaigilb/twinpod-client', () => ({
   ur: {
     hyperFetch: mockHyperFetch,
     uploadFile: mockUploadFile,
+    patchInsert: mockPatchInsert,
     listContainer: mockListContainer,
     ensureContainer: mockEnsureContainer,
     enqueueSave: mockEnqueueSave,
