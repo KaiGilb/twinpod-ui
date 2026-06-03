@@ -64,11 +64,11 @@
  * source of truth for workspace content is the document ref in useWorkspace.js.
  *
  * Subdirectory support: CONFIRMED via Cycle 12 (LDP BasicContainer PUT to
- * {podRoot}/home/TomTwin/ succeeded). The /home/TomTwinProjects/ container is
- * NOT pre-created with a separate ensureContainer step — it auto-materializes
- * on the first index.json / {id}.json PUT to its deep path (write-path-only
- * idiom, Cycle 066; empirically verified). Path segment is clean and
- * human-sensible (taken from the URL), not a server-minted creation slug.
+ * {podRoot}/home/TomTwin/ succeeded). The /home/TomTwinProjects/ container and
+ * each <id>/ project folder are pre-created via _ensureContainer before the first
+ * file write (HEAD-check → 404 → PUT with BasicContainer Link header + rdfs:label).
+ * This is a no-op on pods that auto-materialize (demo.systemtwin.com, tst-plannereu)
+ * and prevents 409 Conflict on strict-LDP pods (tst-planlegger.twinpod.eu).
  *
  * @param {{ document: import('vue').Ref<string> }} workbookRefs
  *   An object containing the shared document ref from useWorkspace. Passed in
@@ -249,32 +249,32 @@ let _lastSavedContent = ''
 // redirect saves go through ensureSessionSaved (Guard B) which awaits
 // saveCurrentSession directly without needing a timer ref.
 
-// --- Container label tracking (Cycle 066-extended, 2026-06-04) ---
+// --- Container pre-creation (Cycle 066-extended rev2, 2026-06-04) ---
 //
-// The TomTwinProjects container (and each <id>/ project folder) is
-// auto-materialized by a plain file PUT with no rdfs:label triple, so the
-// LaunchPad's getLabel() falls through to the uri4uri:path branch and renders
-// the array-coercion comma bug (",TomTwinProjects").
+// tst-planlegger.twinpod.eu returns 409 Conflict when a PUT targets a path
+// whose parent container does not yet exist (unlike demo.systemtwin.com and
+// tst-plannereu which auto-materialize on the first deep-path write). The fix
+// is to HEAD-check and, on 404, PUT the container before writing any file into
+// it. This is FIRE-AND-FORGET: failures are logged as warnings but NEVER block
+// the save path — the app continues to work on pods that auto-materialize.
 //
-// We attempt a best-effort sparql-update PATCH to set rdfs:label on both the
-// root container and each project folder immediately after they materialize.
-// This is FIRE-AND-FORGET: failures are logged as warnings but NEVER block
-// the save path. The app functions correctly regardless — label-set is a
-// cosmetic improvement for pod browsing only.
+// Two levels must be pre-created:
+//   1. TomTwinProjects/ — before first saveIndex() (root container).
+//   2. <id>/            — before first content.json PUT (project container).
 //
-// Prior diagnosis (2026-06-03, tst-plan.twinpod.eu, Reference_Code_TwinPod-
-// DefaultContainers-quirks.md): sparql-update PATCH to a container slash URL
-// returns 401 (wrong endpoint); /node/Substance INSERT succeeds (201) but
-// the triple does not durably persist on cold reads. Both are confirmed on
-// tst-plan; behavior on demo.systemtwin.com may differ — the hook is in
-// place so that if/when the server path works the label lands automatically.
-// FRED-LAUNCHPAD-LABEL-1 (the LaunchPad getLabel array-join fix) is the
-// durable fix; this client-side hook is defense-in-depth.
+// Preconditions for ensureContainer: window.solid.session must be authenticated
+// (the same precondition as all other pod I/O in this composable).
 //
-// _rootContainerLabeled: tracks whether we have already attempted the
-// one-time label set for the TomTwinProjects root container (attempt once
-// per pod-root, not on every createNewSession call).
-let _rootContainerLabeled = false
+// Single-namespace rule exception: ur.uploadFile uses ur.hyperFetch which only
+// sets Content-Type. The BasicContainer Link header CANNOT be added through
+// ur.uploadFile. window.solid.session.fetch is therefore used here explicitly —
+// matching the established precedent in useCreditLedger.js. The fetch is only
+// issued for ensureContainer (HEAD + conditional PUT) and for no other purpose.
+//
+// _rootContainerEnsured: once-per-session guard for the TomTwinProjects/ level.
+// _projectContainersEnsured: Set of <id> values whose folders have been ensured.
+let _rootContainerEnsured = false
+const _projectContainersEnsured = new Set()
 
 // _freshSessions: IDs minted by createNewSession() this session but not yet
 // persisted to content.json. syncManifestIfMigrated() skips the probe for
@@ -334,7 +334,8 @@ export function _resetModuleStateForTesting() {
   _autosaveTimer = null
   _lastSavedContent = ''
   _sessionMeta.clear()
-  _rootContainerLabeled = false
+  _rootContainerEnsured = false
+  _projectContainersEnsured.clear()
   _freshSessions.clear()
 }
 
@@ -502,26 +503,38 @@ export function useSessionIndex({ document }) {
    * container. NEVER throws. NEVER blocks the caller. Logs a warning on failure.
    *
    * Per the Writes standard §1.1: "data ABOUT an existing resource" targets the
-   * resource URI directly. The SPARQL INSERT DATA body uses a fully-qualified
-   * rdfs:label predicate so no @prefix declaration is needed inside INSERT DATA.
+   * HEAD-checks containerUrl; if absent (404), PUTs it as an LDP BasicContainer
+   * with an rdfs:label turtle body. No-op when HEAD returns 200 (already exists).
+   * Best-effort — logs a warning on failure and never blocks the save path.
    *
-   * Prior diagnosis (2026-06-03): this path returns 401 on tst-plan.twinpod.eu.
-   * The hook is in place for when/if the server path is opened; it never blocks
-   * the write path on failure. See _rootContainerLabeled comment above.
+   * Uses window.solid.session.fetch directly (single-namespace exception): the
+   * BasicContainer Link header cannot be added via ur.uploadFile (hyperFetch only
+   * sets Content-Type). This matches the established precedent in useCreditLedger.js.
    *
-   * @param {string} containerUrl - Container URL (trailing slash), e.g. {root}/
-   * @param {string} label        - Human-readable display label string.
+   * @param {string} containerUrl   - Container URL ending with /
+   * @param {string} label          - rdfs:label literal for the new container
+   * @param {string} [slug]         - Slug header hint (display name for SystemTwin tree)
    * @returns {Promise<void>}
    */
-  async function _setContainerLabel(containerUrl, label) {
-    if (!containerUrl || !label) return
+  async function _ensureContainer(containerUrl, label, slug) {
+    if (!containerUrl) return
     try {
-      await ur.patchInsert(
-        containerUrl,
-        `INSERT DATA {\n  <${containerUrl}> <http://www.w3.org/2000/01/rdf-schema#label> "${label.replace(/"/g, '\\"')}" .\n}`
-      )
-    } catch (err) {
-      console.warn('[useSessionIndex] container label-set failed (best-effort):', containerUrl, err?.message || err)
+      const fetch = window?.solid?.session?.fetch
+      if (!fetch) return
+      const check = await fetch(containerUrl, { method: 'HEAD' })
+      if (check.ok || check.status === 200) return // already exists — no-op
+      if (check.status !== 404) return // unexpected status — don't attempt to create
+      const headers = {
+        'Content-Type': 'text/turtle',
+        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+      }
+      if (slug) headers['Slug'] = slug
+      const body = label
+        ? `@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "${label.replace(/"/g, '\\"')}" .`
+        : ''
+      await fetch(containerUrl, { method: 'PUT', headers, body })
+    } catch (e) {
+      console.warn('[useSessionIndex] ensureContainer failed for', containerUrl, e?.message || e)
     }
   }
 
@@ -642,29 +655,28 @@ export function useSessionIndex({ document }) {
     }
   }
 
-  // --- Container materialization: write-path-only idiom (Cycle 066, 2026-06-03) ---
+  // --- Container pre-creation (Cycle 066-extended rev2, 2026-06-04) ---
   //
-  // We deliberately do NOT pre-create the TomTwinProjects container with a
-  // separate ur.ensureContainer (Slug + rdfs:label PUT) step. Per the
-  // Solid-spec deep-path write behaviour (Fred-canonical, Reference_Code_TwinPod-Writes
-  // §10: "if you write to a brand new pod something like /folder1/second/third/...")
-  // a PUT of index.json / {id}.json to {podRoot}/home/TomTwinProjects/<file>
-  // auto-materializes the /home/TomTwinProjects/ container in the SAME operation,
-  // with a clean human-sensible path segment taken from the URL — not a
-  // server-minted creation slug.
+  // tst-planlegger.twinpod.eu (and possibly other strict-LDP pods) returns 409
+  // Conflict when the target container does not exist before a file PUT. The
+  // write-path-only idiom (Cycle 066) works on demo.systemtwin.com and
+  // tst-plannereu (which auto-materialize), but breaks on strict pods.
   //
-  // This was verified empirically against a live pod (Cycle 066): a bare PUT to
-  // a brand-new deep path created the container at the clean path with no
-  // ensureContainer call. This resolves the Cycle 061 ("auto-created on first
-  // write") vs Cycle 048 Stream-B hyp 4 ("need ensureContainer before PUT")
-  // contradiction in favour of Cycle 061: the explicit ensureContainer pre-step
-  // is redundant for our deep-path file writes and is the create-then-place
-  // anti-pattern, so it is removed.
+  // Fix: HEAD-check each container before first write; on 404, PUT it as an
+  // LDP BasicContainer with an rdfs:label turtle body. This is a no-op on pods
+  // that already have the container (HEAD → 200) and creates it cleanly on pods
+  // that require explicit pre-creation (HEAD → 404). The label in the PUT body
+  // also sets a clean name so the LaunchPad skips the uri4uri:path fallback that
+  // produces the leading-comma render bug (",TomTwinProjects").
   //
-  // saveIndex() (called by createNewSession before any per-project file write)
-  // is the first write that materializes the container — so loadIndex no longer
-  // needs to ensure it exists before reading: a 404/empty primary index is the
-  // correct "first use" signal, and the container appears on the first save.
+  // Note: whether the label body is accepted by the server is empirical — the
+  // quirks file records that tst-plan silently drops it. On tst-planlegger
+  // (strict-404 pod) the label may stick. In either case the 409 is resolved.
+  // FRED-LAUNCHPAD-LABEL-1 (the LaunchPad getLabel array-join fix) remains the
+  // only guaranteed comma fix; the label PUT is defense-in-depth.
+  //
+  // saveIndex() (called by createNewSession) is the first write that targets the
+  // TomTwinProjects/ container — ensureContainer runs before it.
 
   // --- Session ID generation ---
 
@@ -706,10 +718,9 @@ export function useSessionIndex({ document }) {
     indexLoading.value = true
     indexLoadError.value = null
 
-    // No pre-create step: the TomTwinProjects container auto-materializes on the
-    // first index.json / {id}.json PUT (write-path-only idiom, Cycle 066 — see the
-    // container-materialization note above). A missing container simply reads as
-    // "first use" (primary index 404/empty) below.
+    // No pre-create step needed for the read path: a missing container reads as
+    // "first use" (primary index 404/empty) below. ensureContainer fires in
+    // createNewSession before the first saveIndex() write.
 
     /**
      * Fetches an index.json from a given root URL.
@@ -967,16 +978,18 @@ export function useSessionIndex({ document }) {
     // programmatic clear as a user edit (Cycle 045 iter-2 change-aware autosave).
     _lastSavedContent = ''
 
-    await saveIndex()
-
-    // Best-effort: set rdfs:label on the TomTwinProjects root container so the
-    // LaunchPad renders it without the leading-comma uri4uri:path fallback.
-    // Fire-and-forget — runs after saveIndex() (which materialized the container).
-    // Attempted ONCE per pod-root per session. Never blocks.
-    if (!_rootContainerLabeled && _podRoot) {
-      _rootContainerLabeled = true
-      _setContainerLabel(sessionsRoot() + '/', 'TomTwinProjects')
+    // Best-effort: pre-create the TomTwinProjects/ container before writing
+    // index.json into it. On pods that auto-materialize (demo.systemtwin.com,
+    // tst-plannereu) this HEAD-checks and no-ops (200). On strict-LDP pods like
+    // tst-planlegger.twinpod.eu it creates the container with a clean label,
+    // preventing the 409 Conflict that would otherwise block saveIndex().
+    // Fire-and-forget — guard is one-time per pod-root per session.
+    if (!_rootContainerEnsured && _podRoot) {
+      _rootContainerEnsured = true
+      await _ensureContainer(sessionsRoot() + '/', 'TomTwinProjects', 'TomTwinProjects')
     }
+
+    await saveIndex()
   }
 
   /**
@@ -1112,6 +1125,18 @@ export function useSessionIndex({ document }) {
     // ──────────────────────────────────────────────────────────────────────────
 
     try {
+      // Pre-create the <id>/ project folder before writing content.json into it.
+      // On pods that auto-materialize (demo, tst-plannereu) this no-ops (HEAD → 200).
+      // On strict-LDP pods (tst-planlegger) it creates the container with a clean
+      // label, preventing the 409 Conflict on the content.json PUT that follows.
+      // Guard: only attempt once per id per session (Set tracks attempted ids).
+      // await to confirm the container exists before the content PUT — the whole
+      // point is to unblock the PUT that follows.
+      if (!_projectContainersEnsured.has(id)) {
+        _projectContainersEnsured.add(id)
+        await _ensureContainer(folderUrl(id), resolvedName, id)
+      }
+
       const fileResponse = await ur.uploadFile(sessionFileUrl, body, 'application/json')
       if (!fileResponse.ok) {
         // Save failed — restore isDirty so retries happen.
@@ -1132,21 +1157,10 @@ export function useSessionIndex({ document }) {
       // user's work and gates isDirty; the manifest is derived identity metadata). A
       // manifest write that fails does NOT restore isDirty — the content is safe and
       // the next save re-PUTs the manifest — but the failure is surfaced so it is not
-      // silent. The deep-path PUT auto-materializes the <id>/ container (write-path-
-      // only idiom); writing content first means the folder already exists here.
+      // silent.
       const manifestResponse = await ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json')
       if (!manifestResponse.ok) {
         sessionSaveError.value = `Saved content, but could not save project manifest (HTTP ${manifestResponse.status || 0}).`
-      }
-
-      // Best-effort: set rdfs:label on the project's <id>/ container so the
-      // LaunchPad renders the project name instead of the comma-prefixed path.
-      // Fire-and-forget — the folder was auto-materialized by the content PUT above.
-      // Only attempted on the FIRST save for this session (when _sessionMeta has no
-      // prior entry). Subsequent saves skip the label-set (already attempted).
-      // Never blocks the save path on failure.
-      if (!_sessionMeta.has(id)) {
-        _setContainerLabel(folderUrl(id), resolvedName)
       }
 
       // Successful save — update meta. Clear the legacy-loaded flag so future loads

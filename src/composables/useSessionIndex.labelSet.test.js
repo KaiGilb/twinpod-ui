@@ -1,37 +1,36 @@
 // UNIT_TYPE=Hook
 //
-// Cycle 066-extended (2026-06-04) — best-effort rdfs:label set for the
-// TomTwinProjects container and each project <id>/ folder.
+// Cycle 066-extended rev2 (2026-06-04) — ensureContainer pre-creation for
+// TomTwinProjects/ and each project <id>/ folder.
 //
-// Spec: F.SetContainerLabel (cosmetic — LaunchPad comma-fix defense-in-depth).
-//       Reference_Code_TwinPod-DefaultContainers-quirks.md § FRED-LAUNCHPAD-LABEL-1.
+// Replaces the prior patchInsert-based label-set approach (a181e14) which
+// returned 401 on tst-plan.twinpod.eu. The ensureContainer approach:
+//   - HEAD-checks the container before any file write.
+//   - On 404: PUTs the container with BasicContainer Link header + rdfs:label body.
+//   - On 200 (already exists): no-op.
+//   - On failure: logs a warning, never blocks the save path.
 //
-// Verifies, against an in-memory pod model (mocked ur.*):
-//   - createNewSession() attempts a patchInsert for the TomTwinProjects/ root
-//     container ONCE after the first saveIndex() (one-time-per-session guard).
-//   - A SECOND createNewSession() does NOT re-attempt the root container label
-//     (idempotent guard: _rootContainerLabeled blocks repeat attempts).
-//   - saveCurrentSession() attempts a patchInsert for the project's <id>/ folder
-//     on the FIRST save (when _sessionMeta has no prior entry for the id).
-//   - saveCurrentSession() does NOT re-attempt the project folder label on
-//     SUBSEQUENT saves of the same session (already-attempted guard).
-//   - patchInsert failure (e.g. 401) is swallowed: saveIndex() still returns
-//     successfully and does NOT throw. Save path is unaffected.
+// Spec: F.EnsureContainer (tst-planlegger 409 fix + label-at-creation defense-in-depth).
+//       Reference_Code_TwinPod-DefaultContainers-quirks.md § container pre-creation.
 //
-// Known empirical result (tst-plan.twinpod.eu, 2026-06-03): patchInsert to a
-// container slash URL returns 401. These tests verify the HOOK (call is
-// attempted with correct args + target URL) and the RESILIENCE (failure does
-// not break the save path). Whether the label actually persists on the server
-// is an empirical question outside the test scope — documented in the quirks
-// file under FRED-LAUNCHPAD-LABEL-1.
+// Verifies:
+//   - createNewSession() calls ensureContainer for TomTwinProjects/ BEFORE saveIndex().
+//   - HEAD returns 200 → no-op (no PUT issued).
+//   - HEAD returns 404 → PUT issued with BasicContainer Link header and rdfs:label body.
+//   - Second createNewSession() does NOT re-attempt the root container (one-time guard).
+//   - saveCurrentSession() calls ensureContainer for the project <id>/ folder BEFORE
+//     the content.json PUT.
+//   - Second saveCurrentSession() for the same id does NOT re-attempt (one-time guard).
+//   - ensureContainer failure (throws) is swallowed: save path is unaffected.
 
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
 import { ref } from 'vue'
 
+// --- Mocks ---
+
 const mockHyperFetch = vi.fn()
 const mockUploadFile = vi.fn()
 const mockPatchInsert = vi.fn()
-const mockEnsureContainer = vi.fn().mockResolvedValue(undefined)
 const mockEnqueueSave = vi.fn()
 const mockDeleteURI = vi.fn().mockResolvedValue(true)
 const _saveListeners = new Set()
@@ -41,7 +40,6 @@ vi.mock('@kaigilb/twinpod-client', () => ({
     hyperFetch: mockHyperFetch,
     uploadFile: mockUploadFile,
     patchInsert: mockPatchInsert,
-    ensureContainer: mockEnsureContainer,
     enqueueSave: mockEnqueueSave,
     deleteURI: mockDeleteURI,
     onSaveEvent: vi.fn((fn) => {
@@ -65,7 +63,10 @@ if (typeof globalThis.window === 'undefined') {
   globalThis.window.localStorage = fakeLocalStorage
 }
 
-const POD_ROOT = 'https://tst-label.example'
+// window.solid.session.fetch mock — injected per test.
+let mockSessionFetch
+
+const POD_ROOT = 'https://tst-ensure.example'
 const ROOT = `${POD_ROOT}/home/TomTwinProjects`
 
 function jsonResponse(obj, status = 200) {
@@ -74,8 +75,19 @@ function jsonResponse(obj, status = 200) {
 function notFound() {
   return { ok: false, status: 404, text: async () => '' }
 }
+function headOk() {
+  return { ok: true, status: 200 }
+}
+function headNotFound() {
+  return { ok: false, status: 404 }
+}
+function putCreated() {
+  return { ok: true, status: 201 }
+}
 
-describe('useSessionIndex — container label-set (Cycle 066-extended)', () => {
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('useSessionIndex — ensureContainer (Cycle 066-extended rev2)', () => {
   let document
   let useSessionIndex
   let _resetModuleStateForTesting
@@ -92,114 +104,273 @@ describe('useSessionIndex — container label-set (Cycle 066-extended)', () => {
     mockHyperFetch.mockReset()
     mockUploadFile.mockReset()
     mockPatchInsert.mockReset()
+    mockSessionFetch = vi.fn()
 
-    // Default: patchInsert succeeds
-    mockPatchInsert.mockResolvedValue({ ok: true, status: 201 })
-    // Default: index.json reads as 404 (first use)
-    mockHyperFetch.mockResolvedValue(notFound())
-    // Default: all uploadFile calls succeed
+    // Wire window.solid.session.fetch for ensureContainer.
+    globalThis.window.solid = { session: { fetch: mockSessionFetch } }
+
+    // Default: all file/index writes succeed.
     mockUploadFile.mockResolvedValue({ ok: true, status: 201 })
+    // Default: index.json reads as 404 (first use).
+    mockHyperFetch.mockResolvedValue(notFound())
+    // Default: HEAD → 200 (container already exists) — no-op path.
+    mockSessionFetch.mockResolvedValue(headOk())
   })
 
   afterEach(() => {
     vi.resetModules()
+    delete globalThis.window.solid
   })
 
-  test('createNewSession attempts patchInsert on root container after first saveIndex()', async () => {
+  // ── Root container (TomTwinProjects/) ────────────────────────────────────
+
+  test('createNewSession — HEAD 200 → no PUT issued (no-op path)', async () => {
+    mockSessionFetch.mockResolvedValue(headOk())
+
+    const { createNewSession, setPodRoot } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+
+    const headCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD')
+    expect(headCalls.length).toBe(1)
+    expect(headCalls[0][0]).toBe(`${ROOT}/`)
+
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBe(0)
+  })
+
+  test('createNewSession — HEAD 404 → PUT issued with BasicContainer Link header', async () => {
+    mockSessionFetch
+      .mockResolvedValueOnce(headNotFound()) // HEAD
+      .mockResolvedValueOnce(putCreated())   // PUT
+
+    const { createNewSession, setPodRoot } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBe(1)
+    const [url, opts] = putCalls[0]
+    expect(url).toBe(`${ROOT}/`)
+    expect(opts.headers['Link']).toBe('<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"')
+    expect(opts.headers['Content-Type']).toBe('text/turtle')
+  })
+
+  test('createNewSession — HEAD 404 → PUT body contains rdfs:label "TomTwinProjects"', async () => {
+    mockSessionFetch
+      .mockResolvedValueOnce(headNotFound())
+      .mockResolvedValueOnce(putCreated())
+
+    const { createNewSession, setPodRoot } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls[0][1].body).toContain('rdfs:label')
+    expect(putCalls[0][1].body).toContain('TomTwinProjects')
+  })
+
+  test('createNewSession — ensureContainer fires BEFORE saveIndex (index PUT succeeds after 404→create)', async () => {
+    // Simulate: HEAD root → 404 (needs create), PUT root → 201 (created),
+    //           then index.json PUT goes via mockUploadFile.
+    const callOrder = []
+    mockSessionFetch.mockImplementation((url, opts) => {
+      if (opts?.method === 'HEAD') { callOrder.push('HEAD'); return headNotFound() }
+      if (opts?.method === 'PUT')  { callOrder.push('PUT');  return putCreated() }
+      return headOk()
+    })
+    mockUploadFile.mockImplementation(() => { callOrder.push('uploadFile'); return { ok: true, status: 201 } })
+
+    const { createNewSession, setPodRoot } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+
+    // ensureContainer (HEAD + PUT) must precede saveIndex's uploadFile call.
+    expect(callOrder[0]).toBe('HEAD')
+    expect(callOrder[1]).toBe('PUT')
+    expect(callOrder[2]).toBe('uploadFile')
+  })
+
+  test('second createNewSession does NOT re-attempt root container (one-time guard)', async () => {
+    mockSessionFetch.mockResolvedValue(headOk())
+
     const { createNewSession, setPodRoot } = useSessionIndex({ document })
     setPodRoot(POD_ROOT)
 
     await createNewSession()
-
-    // patchInsert should have been called EXACTLY once — for the root container.
-    const rootContainerUrl = `${ROOT}/`
-    const rootCalls = mockPatchInsert.mock.calls.filter(([url]) => url === rootContainerUrl)
-    expect(rootCalls.length).toBe(1)
-
-    // The SPARQL body must contain the rdfs:label predicate URI and "TomTwinProjects".
-    const body = rootCalls[0][1]
-    expect(body).toContain('http://www.w3.org/2000/01/rdf-schema#label')
-    expect(body).toContain('TomTwinProjects')
-    expect(body).toContain('INSERT DATA')
-  })
-
-  test('second createNewSession does NOT re-attempt root container label (one-time guard)', async () => {
-    const { createNewSession, setPodRoot } = useSessionIndex({ document })
-    setPodRoot(POD_ROOT)
+    const headAfterFirst = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD').length
 
     await createNewSession()
-    const afterFirst = mockPatchInsert.mock.calls.filter(([url]) => url === `${ROOT}/`).length
+    const headAfterSecond = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD').length
 
-    await createNewSession()
-    const afterSecond = mockPatchInsert.mock.calls.filter(([url]) => url === `${ROOT}/`).length
-
-    expect(afterFirst).toBe(1)
-    expect(afterSecond).toBe(1) // No extra call on second createNewSession.
+    expect(headAfterFirst).toBe(1)
+    expect(headAfterSecond).toBe(1) // No new HEAD on second call.
   })
 
-  test('saveCurrentSession attempts patchInsert on project <id>/ folder on first save', async () => {
-    const { createNewSession, renameSession, saveCurrentSession, setPodRoot, activeSessionId } = useSessionIndex({ document })
-    setPodRoot(POD_ROOT)
+  // ── Project folder (<id>/) ───────────────────────────────────────────────
 
+  test('saveCurrentSession — HEAD 200 → no PUT issued for project folder (no-op path)', async () => {
+    mockSessionFetch.mockResolvedValue(headOk())
+
+    const { createNewSession, saveCurrentSession, setPodRoot, activeSessionId } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
     await createNewSession()
     const id = activeSessionId.value
 
-    // Rename so the session has a known display name.
-    await renameSession(id, 'My Project')
+    // Reset to track only the saveCurrentSession ensureContainer call.
+    mockSessionFetch.mockClear()
+    mockSessionFetch.mockResolvedValue(headOk())
 
-    mockPatchInsert.mockClear()
     document.value = 'some content'
     await saveCurrentSession('My Project')
 
-    const folderUrl = `${ROOT}/${id}/`
-    const folderCalls = mockPatchInsert.mock.calls.filter(([url]) => url === folderUrl)
-    expect(folderCalls.length).toBe(1)
+    const headCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD')
+    expect(headCalls.length).toBe(1)
+    expect(headCalls[0][0]).toBe(`${ROOT}/${id}/`)
 
-    // SPARQL body must contain the rdfs:label predicate URI, the folder URL,
-    // and the project display name.
-    const body = folderCalls[0][1]
-    expect(body).toContain('http://www.w3.org/2000/01/rdf-schema#label')
-    expect(body).toContain('My Project')
-    expect(body).toContain('INSERT DATA')
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBe(0)
   })
 
-  test('saveCurrentSession does NOT re-attempt project folder label on second save', async () => {
+  test('saveCurrentSession — HEAD 404 → PUT issued for project folder with BasicContainer Link header', async () => {
+    // Root container: HEAD 200 (no-op). Project folder: HEAD 404 (needs create).
+    let callCount = 0
+    mockSessionFetch.mockImplementation((url, opts) => {
+      if (opts?.method === 'HEAD') {
+        callCount++
+        if (callCount === 1) return headOk()     // root container (createNewSession)
+        return headNotFound()                     // project folder (saveCurrentSession)
+      }
+      return putCreated()
+    })
+
     const { createNewSession, saveCurrentSession, setPodRoot, activeSessionId } = useSessionIndex({ document })
     setPodRoot(POD_ROOT)
-
     await createNewSession()
     const id = activeSessionId.value
-    const folderUrl = `${ROOT}/${id}/`
 
-    document.value = 'first edit'
+    document.value = 'content'
     await saveCurrentSession('My Project')
 
-    mockPatchInsert.mockClear()
-
-    document.value = 'second edit'
-    await saveCurrentSession('My Project')
-
-    const folderCalls = mockPatchInsert.mock.calls.filter(([url]) => url === folderUrl)
-    expect(folderCalls.length).toBe(0) // No repeat on second save.
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBe(1)
+    const [url, opts] = putCalls[0]
+    expect(url).toBe(`${ROOT}/${id}/`)
+    expect(opts.headers['Link']).toBe('<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"')
   })
 
-  test('patchInsert failure (401) does not throw and does not break save path', async () => {
-    // Simulate the known 401 on container slash URL (tst-plan.twinpod.eu, 2026-06-03).
-    mockPatchInsert.mockRejectedValue(new Error('PATCH failed: 401'))
+  test('saveCurrentSession — HEAD 404 → PUT body contains rdfs:label with project name', async () => {
+    let headCount = 0
+    mockSessionFetch.mockImplementation((url, opts) => {
+      if (opts?.method === 'HEAD') {
+        headCount++
+        if (headCount === 1) return headOk()   // root
+        return headNotFound()                   // project folder
+      }
+      return putCreated()
+    })
+
+    const { createNewSession, renameSession, saveCurrentSession, setPodRoot, activeSessionId } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+    const id = activeSessionId.value
+    await renameSession(id, 'My Test Project')
+
+    document.value = 'hello'
+    await saveCurrentSession('My Test Project')
+
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBe(1)
+    expect(putCalls[0][1].body).toContain('rdfs:label')
+    expect(putCalls[0][1].body).toContain('My Test Project')
+  })
+
+  test('saveCurrentSession — ensureContainer fires BEFORE content.json PUT', async () => {
+    const callOrder = []
+    let headCount = 0
+    mockSessionFetch.mockImplementation((url, opts) => {
+      if (opts?.method === 'HEAD') {
+        callOrder.push('HEAD')
+        headCount++
+        if (headCount === 1) return headOk() // root container
+        return headNotFound()               // project folder
+      }
+      if (opts?.method === 'PUT') { callOrder.push('PUT-container'); return putCreated() }
+      return headOk()
+    })
+    mockUploadFile.mockImplementation(() => {
+      callOrder.push('uploadFile')
+      return { ok: true, status: 201 }
+    })
+
+    const { createNewSession, saveCurrentSession, setPodRoot } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+
+    callOrder.length = 0 // reset after createNewSession
+    document.value = 'text'
+    await saveCurrentSession('Test')
+
+    // HEAD (project folder) → PUT (container) → uploadFile (content.json) order required.
+    expect(callOrder[0]).toBe('HEAD')
+    expect(callOrder[1]).toBe('PUT-container')
+    expect(callOrder.some(e => e === 'uploadFile')).toBe(true)
+    const putsBeforeUpload = callOrder.indexOf('uploadFile')
+    expect(callOrder.indexOf('PUT-container')).toBeLessThan(putsBeforeUpload)
+  })
+
+  test('second saveCurrentSession for same id does NOT re-attempt project folder (one-time guard)', async () => {
+    mockSessionFetch.mockResolvedValue(headOk())
+
+    const { createNewSession, saveCurrentSession, setPodRoot, activeSessionId } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+    const id = activeSessionId.value
+
+    mockSessionFetch.mockClear()
+    mockSessionFetch.mockResolvedValue(headOk())
+
+    document.value = 'first'
+    await saveCurrentSession('P1')
+    const headsAfterFirst = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD').length
+
+    mockSessionFetch.mockClear()
+    document.value = 'second'
+    await saveCurrentSession('P1')
+    const headsAfterSecond = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD').length
+
+    expect(headsAfterFirst).toBe(1)   // one HEAD on first save
+    expect(headsAfterSecond).toBe(0)  // no HEAD on second save (already ensured)
+  })
+
+  // ── Resilience ───────────────────────────────────────────────────────────
+
+  test('ensureContainer failure (throws) does not throw and does not break save path', async () => {
+    // Simulate ensureContainer throwing (e.g. network error).
+    mockSessionFetch.mockRejectedValue(new Error('network error'))
 
     const { createNewSession, saveCurrentSession, setPodRoot, sessionSaveError, activeSessionId } = useSessionIndex({ document })
     setPodRoot(POD_ROOT)
 
-    // Both createNewSession and saveCurrentSession must succeed despite patchInsert throwing.
+    // createNewSession must succeed despite ensureContainer throwing.
     await expect(createNewSession()).resolves.not.toThrow()
     expect(sessionSaveError.value).toBeNull()
 
+    // saveCurrentSession must also succeed.
     document.value = 'content'
     await expect(saveCurrentSession('Test')).resolves.not.toThrow()
-
-    // sessionSaveError must remain null — the label-set failure is suppressed.
-    // (sessionSaveError can be set by the content/manifest PUT, but not by patchInsert.)
-    // Upload mocks are all ok so no save error.
     expect(sessionSaveError.value).toBeNull()
+  })
+
+  test('patchInsert is NOT called (old label-set approach removed)', async () => {
+    mockSessionFetch.mockResolvedValue(headOk())
+
+    const { createNewSession, saveCurrentSession, setPodRoot } = useSessionIndex({ document })
+    setPodRoot(POD_ROOT)
+    await createNewSession()
+    document.value = 'abc'
+    await saveCurrentSession('P')
+
+    expect(mockPatchInsert).not.toHaveBeenCalled()
   })
 })
