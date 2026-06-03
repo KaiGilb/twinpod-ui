@@ -5,6 +5,11 @@ export { useTrial } from './composables/useTrial.js'
 export { usePodWorkbook } from './composables/usePodWorkbook.js'
 export {
   useSessionIndex,
+  // SESSIONS_ROOT_PATH (Cycle 066) — single source of truth for the projects
+  // storage root ('/home/TomTwinProjects'). Exported so the host app's
+  // useDocumentUpload nests attachments under the SAME root without a hardcoded
+  // duplicate (4Sol.S.TwinPodProjectIndex single-path rule).
+  SESSIONS_ROOT_PATH,
   // Emergency hotfix round 2 (2026-05-14) — session-agnostic scratch-draft
   // helpers, exported so App.vue can drive the Layer 1 / Layer 2 watchers
   // without re-implementing the localStorage key contract.

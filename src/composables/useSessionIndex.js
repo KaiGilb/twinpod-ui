@@ -22,9 +22,11 @@
  * source of truth for workspace content is the document ref in useWorkspace.js.
  *
  * Subdirectory support: CONFIRMED via Cycle 12 (LDP BasicContainer PUT to
- * {podRoot}/home/TomTwin/ succeeded). The same pattern is used for
- * SESSIONS_ROOT_PATH = '/home/TomTwinProjects'. Container creation is
- * idempotent — 409 is acceptable.
+ * {podRoot}/home/TomTwin/ succeeded). The /home/TomTwinProjects/ container is
+ * NOT pre-created with a separate ensureContainer step — it auto-materializes
+ * on the first index.json / {id}.json PUT to its deep path (write-path-only
+ * idiom, Cycle 066; empirically verified). Path segment is clean and
+ * human-sensible (taken from the URL), not a server-minted creation slug.
  *
  * @param {{ document: import('vue').Ref<string> }} workbookRefs
  *   An object containing the shared document ref from useWorkspace. Passed in
@@ -79,7 +81,13 @@ import { ur } from '@kaigilb/twinpod-client'
 // To use flat-file fallback, change this to '/home/TomTwinProjects' prefix and adjust
 // _sessionsRoot() to return podRoot + SESSIONS_ROOT_PATH (no trailing slash) as a prefix
 // rather than a directory.
-const SESSIONS_ROOT_PATH = '/home/TomTwinProjects'
+//
+// EXPORTED (Cycle 066) so consumers that must write SIBLING resources under the
+// same projects root — e.g. the app's useDocumentUpload attachment path — derive
+// the root from this single constant rather than hardcoding a second copy. Honors
+// 4Sol.S.TwinPodProjectIndex: "No other file may hardcode this path — all
+// references go through SESSIONS_ROOT_PATH", so changing the location is one edit.
+export const SESSIONS_ROOT_PATH = '/home/TomTwinProjects'
 
 // Legacy path — the original production location for session files (pre-Cycle-021).
 // Read-only fallback to surface existing user data after the path rename. Saves always
@@ -400,27 +408,29 @@ export function useSessionIndex({ document }) {
     return _podRoot.replace(/\/+$/, '') + LEGACY_SESSIONS_ROOT_PATH
   }
 
-  /**
-   * Ensures the sessions container exists on the pod using an LDP BasicContainer PUT.
-   * Idempotent — 409 (already exists) is treated as success.
-   *
-   * Cycle-046 (BareFileSave 2026-05-23): delegates to the canonical
-   * ur.ensureContainer primitive in @kaigilb/twinpod-client. The previous
-   * inline HEAD-less PUT was one of three near-duplicate copies across the
-   * codebase; promoting the primitive removed the duplication and restores
-   * the HEAD-probe (avoids unnecessary PUTs on every load).
-   *
-   * @returns {Promise<void>}
-   */
-  async function ensureSessionsContainer() {
-    // /home/ exists by default on TwinPod, so we only need to ensure the leaf container.
-    // The TwinPodData container at /apps/TomTwin/ is ensured by useCreditLedger /
-    // useUserFactStore — not our concern here.
-    await ur.ensureContainer(sessionsRoot() + '/', {
-      slug: 'TomTwinProjects',
-      label: 'TomTwinProjects'
-    })
-  }
+  // --- Container materialization: write-path-only idiom (Cycle 066, 2026-06-03) ---
+  //
+  // We deliberately do NOT pre-create the TomTwinProjects container with a
+  // separate ur.ensureContainer (Slug + rdfs:label PUT) step. Per the
+  // Solid-spec deep-path write behaviour (Fred-canonical, Reference_Code_TwinPod-Writes
+  // §10: "if you write to a brand new pod something like /folder1/second/third/...")
+  // a PUT of index.json / {id}.json to {podRoot}/home/TomTwinProjects/<file>
+  // auto-materializes the /home/TomTwinProjects/ container in the SAME operation,
+  // with a clean human-sensible path segment taken from the URL — not a
+  // server-minted creation slug.
+  //
+  // This was verified empirically against a live pod (Cycle 066): a bare PUT to
+  // a brand-new deep path created the container at the clean path with no
+  // ensureContainer call. This resolves the Cycle 061 ("auto-created on first
+  // write") vs Cycle 048 Stream-B hyp 4 ("need ensureContainer before PUT")
+  // contradiction in favour of Cycle 061: the explicit ensureContainer pre-step
+  // is redundant for our deep-path file writes and is the create-then-place
+  // anti-pattern, so it is removed.
+  //
+  // saveIndex() (called by createNewSession before any per-project file write)
+  // is the first write that materializes the container — so loadIndex no longer
+  // needs to ensure it exists before reading: a 404/empty primary index is the
+  // correct "first use" signal, and the container appears on the first save.
 
   // --- Session ID generation ---
 
@@ -450,7 +460,8 @@ export function useSessionIndex({ document }) {
    * On 404: treats as empty index (first use) — sets sessionList to [].
    * On other errors: sets indexLoadError.
    *
-   * Also ensures the sessions container exists (idempotent PUT).
+   * Does NOT pre-create the container: it auto-materializes on the first save
+   * (write-path-only idiom, Cycle 066). A missing container reads as "first use".
    *
    * Spec: 3P.F.SessionList, 4Sol.S.TwinPodSessionIndex
    * @returns {Promise<void>}
@@ -461,8 +472,10 @@ export function useSessionIndex({ document }) {
     indexLoading.value = true
     indexLoadError.value = null
 
-    // Ensure the sessions container exists before trying to read/write inside it.
-    await ensureSessionsContainer()
+    // No pre-create step: the TomTwinProjects container auto-materializes on the
+    // first index.json / {id}.json PUT (write-path-only idiom, Cycle 066 — see the
+    // container-materialization note above). A missing container simply reads as
+    // "first use" (primary index 404/empty) below.
 
     /**
      * Fetches an index.json from a given root URL.
