@@ -195,24 +195,27 @@ const MANIFEST_OWNER_PLACEHOLDER = null
 //      when PUTting TO a URL was the root cause of the prior doubling bug that
 //      created /home/TomTwinProjects/TomTwinProjects/ (commit dce9ccf).
 //
-// Correct invocation — NO Slug, PUT goes TO the target URL:
-//   PUT {root}/TomTwinProjects/  → creates the container AT that URL.
-//   PUT {root}/TomTwinProjects/<id>/  → creates the project container AT that URL.
+// Correct invocation — NO Slug, PUT goes TO the target URL, WITH the captured
+// label body so the container gets a CLEAN display name (no leading comma):
+//   PUT {root}/TomTwinProjects/  text/turtle  body `<> rdfs:label "TomTwinProjects" .`
+//   PUT {root}/TomTwinProjects/<id>/  text/turtle  body `<> rdfs:label "<display-name>" .`
 //
-// The POST-2026-05-30 note about "Fred removed the turtle-into-pod hack" referred
-// to server-side automatic label injection from the Turtle body — NOT to the PUT
-// container creation itself. The container IS created by the PUT; the rdfs:label
-// body line is silently dropped post-2026-05-30, so the body is sent empty.
+// AUTHORITATIVE RECIPE (supersedes the earlier "label body silently dropped
+// post-2026-05-30" belief): the live wire-capture of the production Accelerator
+// (twinpod.eu/app, 2026-06-03 — Reference_Code_TwinPod-AcceleratorWireMap.md
+// § "Create a folder (container)") shows the trailing-slash text/turtle PUT with
+// body `<> rdfs:label "<Name>" .` returning 200 with the label PERSISTING and a
+// clean name in the tree. The leading-comma symptom appears only when a container
+// has NO label triple. The earlier "silently dropped" diagnosis was app-auth /
+// wrong-verb confusion and is corrected here and in
+// Reference_Code_TwinPod-DefaultContainers-quirks.md.
 //
 // Write-order still applies as belt-and-suspenders (lenient pods get the auto-
 // materialisation path; strict pods get the pre-created container):
-//   Step 1: _ensureContainer(TomTwinProjects/) → exists or created.
+//   Step 1: _ensureContainer(TomTwinProjects/, "TomTwinProjects") → exists or created.
 //   Step 2: saveIndex() writes index.json → no-op on the container.
-//   Step 3: _ensureContainer(<id>/) → exists or created.
+//   Step 3: _ensureContainer(<id>/, <display-name>) → exists or created.
 //   Step 4: saveCurrentSession writes manifest.json BEFORE content.json.
-//
-// The label (comma) in the SystemTwin tree for pre-existing containers is a
-// Fred-side fix — it is NOT blocking this change.
 
 // Module-level state so App.vue and all injected children share the same reactive refs.
 const sessionList = ref([])
@@ -330,24 +333,33 @@ const _projectContainersEnsured = new Set()
  * container INSIDE the URL, not at it — that is what caused the doubling bug in dce9ccf.
  * // NO Slug header — Slug on PUT creates a child INSIDE the container, not AT the URL.
  *
- * Body is intentionally empty: the rdfs:label line is silently dropped by TwinPod™
- * post-2026-05-30. The container IS created; label is a Fred-side concern.
+ * Body = the AUTHORITATIVE captured wire recipe `<> rdfs:label "<Name>" .` (text/turtle).
+ * This is what gives the container its clean display name and eliminates the leading
+ * comma the LaunchPad renders for an unlabeled container. Source: live wire-capture of
+ * the production Accelerator (twinpod.eu/app, 2026-06-03) — see
+ * Reference_Code_TwinPod-AcceleratorWireMap.md § "Create a folder (container)":
+ *   PUT <pod>/home/<Name>/  Content-Type: text/turtle  body: <> rdfs:label "<Name>" .  → 200
+ * This SUPERSEDES the earlier "rdfs:label body silently dropped post-2026-05-30" claim
+ * (that diagnosis was app-auth / wrong-verb confusion); the live app-authorized capture
+ * proves the label body persists with a clean name in the tree.
  *
  * @param {string} containerUrl - URL of the container to ensure (must end with /).
  * @param {Function} authenticatedFetch - DPoP-authenticated session.fetch.
- * @returns {Promise<void>}
- */
-/**
+ * @param {string} label - rdfs:label literal written into the container's Turtle body
+ *   (the friendly display name shown in the LaunchPad tree). Quotes are escaped.
  * @returns {Promise<boolean>} true when the container exists or was successfully
  *   created; false when the container could not be confirmed or created (guard
  *   must NOT be set in that case — the next save should retry).
  */
-async function _ensureContainer(containerUrl, authenticatedFetch) {
+async function _ensureContainer(containerUrl, authenticatedFetch, label) {
   if (!authenticatedFetch) return true // no fetch wired — treat as "ok to proceed"
   try {
     const head = await authenticatedFetch(containerUrl, { method: 'HEAD' })
     if (head.ok) return true   // already exists — no PUT needed
     if (head.status !== 404) return false // unexpected status — don't attempt create
+    // Captured wire body — the bare `<> rdfs:label "<Name>" .` triple. No @prefix line
+    // (rdfs: is a server-recognized default), matching the production Accelerator capture.
+    const safeLabel = String(label ?? '').replace(/"/g, '\\"')
     const put = await authenticatedFetch(containerUrl, {
       method: 'PUT',
       headers: {
@@ -355,7 +367,7 @@ async function _ensureContainer(containerUrl, authenticatedFetch) {
         'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
         // NO Slug header — Slug on PUT creates a child INSIDE the container, not AT the URL.
       },
-      body: '' // empty — rdfs:label body is silently dropped post-2026-05-30
+      body: `<> rdfs:label "${safeLabel}" .` // captured Accelerator recipe — sets the clean container name
     })
     // Return true only if PUT succeeded (2xx). A failed PUT means the container may
     // not exist; caller must not cache the guard as "done" — retry on next save.
@@ -1003,7 +1015,8 @@ export function useSessionIndex({ document }) {
     // the ensureContainer HEAD may get a 404 and the subsequent PUT auto-materialises
     // the container (same end result). Best-effort: failure does not block saveIndex().
     if (!_rootContainerEnsured) {
-      const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch)
+      // Label = "TomTwinProjects" — the clean parent-container display name.
+      const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch, 'TomTwinProjects')
       // Only cache the guard on success. A failed PUT means the container may not
       // exist; the next save will retry rather than silently skip the check.
       if (ok) _rootContainerEnsured = true
@@ -1157,11 +1170,15 @@ export function useSessionIndex({ document }) {
       // _ensureContainer is logged and does not throw; the subsequent file PUT may
       // still succeed on lenient pods where auto-materialisation covers the gap.
       if (!_rootContainerEnsured) {
-        const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch)
+        // Label = "TomTwinProjects" — the clean parent-container display name.
+        const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch, 'TomTwinProjects')
         if (ok) _rootContainerEnsured = true
       }
       if (!_projectContainersEnsured.has(id)) {
-        const ok = await _ensureContainer(folderUrl(id), _sessionFetch)
+        // Label = the project's friendly display name (resolvedName), NOT the id slug.
+        // The path stays the stable <id> (portable); only the tree label is the human
+        // name (e.g. "Sanskrit"). resolvedName is read from sessionList above.
+        const ok = await _ensureContainer(folderUrl(id), _sessionFetch, resolvedName)
         if (ok) _projectContainersEnsured.add(id)
       }
 

@@ -445,6 +445,90 @@ describe('useSessionIndex — Cycle 066-extended DEEP self-contained project fol
     // HEAD was issued first.
     const headCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD')
     expect(headCalls.length).toBeGreaterThan(0)
+
+    // AUTHORITATIVE captured-wire recipe (AcceleratorWireMap 2026-06-03): every
+    // container-creation PUT carries the rdfs:label body (NOT empty) and NO Slug header.
+    for (const [, opts] of putCalls) {
+      expect(opts.headers['Content-Type']).toBe('text/turtle')
+      expect(opts.headers).not.toHaveProperty('Slug')
+      expect(opts.body).toMatch(/<>\s+rdfs:label\s+"[^"]+"\s*\./)
+    }
+  })
+
+  // AUTHORITATIVE captured-wire recipe assertions (AcceleratorWireMap 2026-06-03):
+  //   - parent TomTwinProjects/ container PUT body = `<> rdfs:label "TomTwinProjects" .`
+  //   - project <id>/ container PUT body = `<> rdfs:label "<display-name>" .`  (the
+  //     friendly NAME, not the id slug — the path stays the stable id)
+  //   - both: Content-Type text/turtle, trailing slash on the URL, NO Slug header.
+  test('_ensureContainer: PUT body carries rdfs:label = clean name for parent and project folder (no Slug, trailing slash)', async () => {
+    const id = 'sanskrit-zzzz'
+    const displayName = 'Sanskrit'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts?.method === 'PUT') return { ok: true, status: 200 }
+      return { ok: false, status: 404 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: displayName, project: 'The Brain', lastModified: new Date().toISOString() }]
+
+    await hook.saveCurrentSession(displayName)
+
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+
+    // Parent container PUT: URL ends with TomTwinProjects/ (trailing slash), label "TomTwinProjects".
+    const parentPut = putCalls.find(([u]) => u === `${ROOT}/`)
+    expect(parentPut).toBeTruthy()
+    expect(parentPut[0].endsWith('/')).toBe(true)
+    expect(parentPut[1].headers['Content-Type']).toBe('text/turtle')
+    expect(parentPut[1].headers).not.toHaveProperty('Slug')
+    expect(parentPut[1].body).toBe('<> rdfs:label "TomTwinProjects" .')
+
+    // Project folder PUT: URL is {root}/<id>/ (stable id + trailing slash), label = display NAME.
+    const folderPut = putCalls.find(([u]) => u === `${ROOT}/${id}/`)
+    expect(folderPut).toBeTruthy()
+    expect(folderPut[0].endsWith('/')).toBe(true)
+    expect(folderPut[0]).toContain(`/${id}/`)            // path uses the stable id, not the name
+    expect(folderPut[1].headers['Content-Type']).toBe('text/turtle')
+    expect(folderPut[1].headers).not.toHaveProperty('Slug')
+    expect(folderPut[1].body).toBe(`<> rdfs:label "${displayName}" .`)  // friendly name, not the id
+  })
+
+  // Quote-escaping: a project name containing a double-quote is escaped in the body
+  // so the Turtle triple stays well-formed.
+  test('_ensureContainer: project-folder label escapes double-quotes in the name', async () => {
+    const id = 'quoted-yyyy'
+    const displayName = 'My "Quoted" Project'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts?.method === 'PUT') return { ok: true, status: 200 }
+      return { ok: false, status: 404 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: displayName, project: 'The Brain', lastModified: new Date().toISOString() }]
+
+    await hook.saveCurrentSession(displayName)
+
+    const folderPut = mockSessionFetch.mock.calls.find(([u, opts]) => u === `${ROOT}/${id}/` && opts?.method === 'PUT')
+    expect(folderPut).toBeTruthy()
+    expect(folderPut[1].body).toBe('<> rdfs:label "My \\"Quoted\\" Project" .')
   })
 
   // HEAD-200 → no PUT: when the container already exists, ensureContainer skips the PUT.
