@@ -282,4 +282,38 @@ describe('useSessionIndex — Cycle 066 TomTwinProjects + dual-read', () => {
     await hook.loadIndex()
     expect(hook.sessionList.value.map(s => s.id)).toContain(legacyOnly)
   })
+
+  // Regression guard for the doubling bug (Cycle 066-extended, 2026-06-04):
+  // commit dce9ccf's _ensureContainer called PUT /home/TomTwinProjects/ with
+  // Slug:TomTwinProjects, which on a strict LDP pod created the nested child
+  // container /home/TomTwinProjects/TomTwinProjects/. That call was removed in
+  // 0f700a2. This test asserts that neither saveIndex nor saveCurrentSession
+  // ever writes to a URL containing the doubled segment, and that no basic-
+  // container PUT is issued (the write-order idiom replaced ensureContainer).
+  test('no write ever targets …/TomTwinProjects/TomTwinProjects/… (doubling regression)', async () => {
+    const id = 'my-project-a1b2'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('some content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+
+    // Full new-project create flow: createNewSession → saveCurrentSession.
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: 'My Project', project: 'The Brain', lastModified: '2026-06-04T00:00:00.000Z' }]
+    await hook.saveIndex()
+    await hook.saveCurrentSession('My Project')
+
+    const allUrls = mockUploadFile.mock.calls.map(([u]) => u)
+    // No URL may contain the doubled TomTwinProjects segment.
+    const doubled = allUrls.filter(u => u.includes('TomTwinProjects/TomTwinProjects'))
+    expect(doubled).toHaveLength(0)
+    // No BasicContainer PUT should be issued (write-order idiom only).
+    // Confirmed by the absence of any turtle body in uploadFile calls —
+    // all calls are JSON or binary, never text/turtle BasicContainer.
+    const turtleCalls = mockUploadFile.mock.calls.filter(([, , ct]) =>
+      typeof ct === 'string' && ct.includes('turtle')
+    )
+    expect(turtleCalls).toHaveLength(0)
+  })
 })
