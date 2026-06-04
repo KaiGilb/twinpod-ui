@@ -962,16 +962,81 @@ export function useSessionIndex({ document }) {
   }
 
   /**
-   * Creates a new session entry, appends it to sessionList, saves the index,
-   * and sets the new session as active.
+   * Builds the seed body for a brand-new project: a single `# <name>` heading
+   * line so the project name is visible at the top of the document the moment it
+   * is created (3P.F.SessionCreate — name-shown-at-top, Kai 2026-06-04). An
+   * optional `extra` body (the scratch-promotion path's captured keystrokes) is
+   * appended below the heading so a "type-to-create" promotion never loses the
+   * user's first words.
    *
-   * The new project gets a default name 'Project' (user can rename inline immediately).
-   * project defaults to 'The Brain'.
+   * The heading line is recognised verbatim on later rename (see
+   * SEED_HEADING_RE) so a rename can update it in place without leaving a stale
+   * or duplicate name line (rename-safety, criterion 3).
+   *
+   * @param {string} name - The project's display name.
+   * @param {string} [extra] - Optional existing body to preserve below the heading.
+   * @returns {string}
+   */
+  function buildSeedBody(name, extra = '') {
+    const heading = `# ${name}`
+    const body = String(extra ?? '')
+    return body ? `${heading}\n\n${body}` : `${heading}\n\n`
+  }
+
+  /**
+   * Rename-safety helper (criterion 3): rewrites a seeded `# <oldName>` heading
+   * on the FIRST line of `body` to `# <newName>`, in place, WITHOUT adding a
+   * second name line. Returns null when the first line is NOT exactly the
+   * machine-seeded heading for `oldName` — i.e. the user edited or removed it, or
+   * the project predates seeding — in which case the caller must leave the body
+   * untouched (never append a duplicate name line).
+   *
+   * Matching is exact against the seed shape `# <oldName>` so we only ever touch
+   * the line WE wrote; any user edit to that line (different text, extra words)
+   * fails the match and is preserved verbatim.
+   *
+   * @param {string} body - Current document body.
+   * @param {string} oldName - The name the heading was seeded with.
+   * @param {string} newName - The new project name.
+   * @returns {string|null} Rewritten body, or null if no seeded heading to update.
+   */
+  function rewriteSeededHeading(body, oldName, newName) {
+    const text = String(body ?? '')
+    const nlIdx = text.indexOf('\n')
+    const firstLine = nlIdx === -1 ? text : text.slice(0, nlIdx)
+    if (firstLine !== `# ${oldName}`) return null // not our seeded heading — leave it.
+    const rest = nlIdx === -1 ? '' : text.slice(nlIdx)
+    return `# ${newName}${rest}`
+  }
+
+  /**
+   * Creates a new session entry, appends it to sessionList, sets it active, and
+   * — Cycle 067, 2026-06-04 — persists the project to the pod IMMEDIATELY:
+   * folder + manifest.json + content.json are written on create with NO user
+   * action required (3P.F.SessionCreate immediate-persist goal). Previously
+   * createNewSession only wrote index.json; the project folder/files were not
+   * written until a later lifecycle event (e.g. navigating away and back). The
+   * create path now calls saveCurrentSession() directly, which writes
+   * manifest.json → content.json → index.json in the container-ensured,
+   * idempotent order. Stable per-id URLs keep the write idempotent (no pod
+   * litter — a re-created/abandoned project writes to the same three resources).
+   *
+   * The document is seeded with a `# <name>` heading (buildSeedBody) so the
+   * project name is visible at the top immediately.
+   *
+   * @param {Object} [opts]
+   * @param {string} [opts.name] - Explicit project name (name-modal path). When
+   *   omitted, a disambiguated default "Project YYYY-MM-DD HH:MM" is used. Passing
+   *   the final name here means the name-modal path needs NO separate renameSession
+   *   call — the name lands in the single create-time write, so there is no
+   *   transient stale heading and no second content PUT.
+   * @param {string} [opts.seedBody] - Optional existing body (scratch-promotion
+   *   captured keystrokes) preserved below the seeded heading.
+   * @returns {Promise<void>}
    *
    * Spec: 3P.F.SessionCreate
-   * @returns {Promise<void>}
    */
-  async function createNewSession() {
+  async function createNewSession(opts = {}) {
     // Auto-save outgoing session if there are unsaved changes — mirrors switchToSession.
     // Cycle 046: route through flushPendingSaves so the save runs through the queue
     // (serialised against any in-flight autosave on the outgoing session).
@@ -979,49 +1044,43 @@ export function useSessionIndex({ document }) {
       await flushPendingSaves(3000)
     }
 
-    // Auto-disambiguate the default name by appending a date+time stamp so
-    // two rapid "New Project" clicks don't collide on the slug ('project').
+    // Name resolution: an explicit name (name-modal path) lands in the single
+    // create-time write so no separate rename is needed. Otherwise auto-
+    // disambiguate the default with a date+time stamp so two rapid "New Project"
+    // clicks don't collide on the slug ('project').
     // Format: "Project YYYY-MM-DD HH:MM" → slug "project-YYYY-MM-DD-HH-MM".
-    // If a caller later supplies an explicit user-typed name, this default
-    // is replaced via renameSession — only the DEFAULT is timestamped.
+    const explicitName = String(opts.name ?? '').trim()
     const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ')
-    const name = `Project ${timestamp}`
+    const name = explicitName || `Project ${timestamp}`
     const id = generateSessionId(name)
     const lastModified = new Date().toISOString()
 
-    // Mark as fresh — content.json has not been written yet. This suppresses
-    // the syncManifestIfMigrated content.json probe during the rename that
-    // immediately follows createNewSession() in createNewProjectWithName(),
-    // preventing a console 404 on every new project creation.
+    // Mark as fresh — content.json has not been written yet. saveCurrentSession()
+    // (called below) clears this on its first successful content.json write. If the
+    // immediate create-save FAILS, the id stays fresh so a follow-up rename does not
+    // probe a content.json that isn't there yet (avoids a spurious console 404).
     _freshSessions.add(id)
 
     const newEntry = { id, name, project: 'The Brain', lastModified }
     sessionList.value = [...sessionList.value, newEntry]
 
-    // Set active and clear workspace BEFORE the network save (optimistic update).
-    // This lets Vue re-render the panel immediately — the new session gets the
-    // is-active highlight and the rename input appears without waiting for saveIndex().
-    // onCreateNewSession in SessionPanel finds the session as soon as this returns.
+    // Set active and seed the workspace with the name heading BEFORE the network
+    // save (optimistic update). This lets Vue re-render the panel immediately and
+    // shows the project name at the top of the new document. Sync the change-aware
+    // watcher baseline to the seeded body so the autosave watcher does NOT treat
+    // this programmatic seed as a user edit (Cycle 045 iter-2 change-aware autosave).
     activeSessionId.value = id
-    document.value = ''
-    // Sync change-aware watcher baseline so the watcher does NOT treat this
-    // programmatic clear as a user edit (Cycle 045 iter-2 change-aware autosave).
-    _lastSavedContent = ''
+    const seeded = buildSeedBody(name, opts.seedBody)
+    document.value = seeded
+    _lastSavedContent = seeded
 
-    // Ensure TomTwinProjects/ container exists before writing index.json.
-    // Required on strict-LDP pods (tst-planlegger, tst-solveig) where a PUT to a
-    // path whose immediate parent does not exist returns 409. The guard is a no-op
-    // once confirmed this session (_rootContainerEnsured). On lenient pods (demo)
-    // the ensureContainer HEAD may get a 404 and the subsequent PUT auto-materialises
-    // the container (same end result). Best-effort: failure does not block saveIndex().
-    if (!_rootContainerEnsured) {
-      // Label = "TomTwinProjects" — the clean parent-container display name.
-      const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch, 'TomTwinProjects')
-      // Only cache the guard on success. A failed PUT means the container may not
-      // exist; the next save will retry rather than silently skip the check.
-      if (ok) _rootContainerEnsured = true
-    }
-    await saveIndex()
+    // Immediate persist (Cycle 067): write the project's folder + manifest.json +
+    // content.json to the pod NOW via saveCurrentSession — which also writes
+    // index.json and clears the id from _freshSessions on success. This replaces
+    // the prior saveIndex()-only create path; we do NOT call saveIndex() as well
+    // (saveCurrentSession calls it internally). The container-ensure for
+    // TomTwinProjects/ and <id>/ happens inside saveCurrentSession.
+    await saveCurrentSession(name)
   }
 
   /**
@@ -1489,10 +1548,31 @@ export function useSessionIndex({ document }) {
     const trimmed = newName.trim()
     if (!trimmed) return
 
+    // Capture the OLD name BEFORE the optimistic update destroys it — needed to
+    // recognise and update the seeded `# <oldName>` heading (rename-safety,
+    // criterion 3).
+    const oldName = sessionList.value.find(s => s.id === id)?.name ?? ''
+
     // Optimistic update — update UI immediately.
     sessionList.value = sessionList.value.map(s =>
       s.id === id ? { ...s, name: trimmed, lastModified: new Date().toISOString() } : s
     )
+
+    // Rename-safety (criterion 3): if THIS is the open project and its document
+    // still carries the machine-seeded `# <oldName>` heading on the first line,
+    // rewrite it to `# <trimmed>` in place. We mutate document.value only — the
+    // EXISTING change-aware autosave persists it (no content PUT added here, so the
+    // Cycle-046/047 rename-race that dropped the body re-PUT cannot recur). If the
+    // user edited the heading, rewriteSeededHeading returns null and we leave the
+    // body untouched — never appending a duplicate name line. Not-open projects are
+    // not touched: their name is authoritative in index.json/manifest.json and the
+    // stale heading (if any) is corrected on next open + edit.
+    if (id === activeSessionId.value) {
+      const rewritten = rewriteSeededHeading(document.value, oldName, trimmed)
+      if (rewritten !== null && rewritten !== document.value) {
+        document.value = rewritten
+      }
+    }
 
     // Persist updated index.
     await saveIndex()

@@ -317,42 +317,154 @@ describe('useSessionIndex — Cycle 066-extended DEEP self-contained project fol
     expect(mockUploadFile.mock.calls.some(([u]) => u === `${ROOT}/index.json`)).toBe(true)
   })
 
-  // BUG FIX (Cycle 066-extended, 2026-06-04) — createNewSession → renameSession
-  // must NOT probe content.json for a brand-new project. The probe would always
-  // 404 (content.json is only written on the first saveCurrentSession), logging
-  // a spurious browser console error on every new project creation.
+  // IMMEDIATE PERSIST (Cycle 067, 2026-06-04) — createNewSession now writes the
+  // project's folder + manifest.json + content.json + index.json to the pod on
+  // create, with no user action and no navigation trick required. The three pod
+  // files appear synchronously with the create call.
   //
-  // Mechanism: createNewSession() adds the new id to _freshSessions; renameSession
-  // calls syncManifestIfMigrated which early-returns when the id is in _freshSessions,
-  // never issuing the GET. No hyperFetch call expected for content.json here.
-  test('renameSession does NOT probe content.json for a brand-new (fresh) session', async () => {
+  // (This supersedes the Cycle 066-extended "createNewSession is fresh, no
+  // content.json until first save" behaviour: the immediate save IS the first
+  // save, so the session is no longer fresh after create and a follow-up rename
+  // legitimately probes content.json — see the next test.)
+  test('createNewSession writes folder + manifest.json + content.json + index.json immediately', async () => {
     mockHyperFetch.mockImplementation(async (url) => {
-      // An index.json load (loadIndex) may fire; everything else should be absent.
       if (url.endsWith('/index.json')) return notFound()
       return notFound()
     })
     mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
 
     const { useSessionIndex } = await importHook()
-    const hook = useSessionIndex({ document: ref('') })
+    const docRef = ref('')
+    const hook = useSessionIndex({ document: docRef })
     hook.setPodRoot(POD_ROOT)
 
-    // createNewSession() adds the id to _freshSessions.
     await hook.createNewSession()
     const id = hook.activeSessionId.value
     expect(id).toBeTruthy()
 
-    vi.clearAllMocks() // reset call counts so only the rename's calls are observed.
+    const putUrls = mockUploadFile.mock.calls.map(([u]) => u)
+    expect(putUrls).toContain(`${ROOT}/${id}/manifest.json`) // identity metadata
+    expect(putUrls).toContain(`${ROOT}/${id}/content.json`)  // editable content
+    expect(putUrls).toContain(`${ROOT}/index.json`)          // derived catalog
+
+    // The seeded document shows the project name at the top as a `# <name>` heading.
+    expect(docRef.value.startsWith('# ')).toBe(true)
+    const contentCall = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/${id}/content.json`)
+    const contentDocBody = JSON.parse(contentCall[1])
+    expect(contentDocBody.blocks[0].text).toBe(docRef.value)
+  })
+
+  // An explicit name passed to createNewSession({ name }) lands in the SINGLE
+  // create-time write — no separate rename, no transient stale heading.
+  test('createNewSession({ name }) seeds the given name and writes it in one shot', async () => {
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url.endsWith('/index.json')) return notFound()
+      return notFound()
+    })
     mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
 
-    // The rename must NOT probe content.json (fresh session, not yet persisted).
-    await hook.renameSession(id, 'My New Project')
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+
+    await hook.createNewSession({ name: 'My Cool Project' })
+    const id = hook.activeSessionId.value
+
+    expect(docRef.value.startsWith('# My Cool Project')).toBe(true)
+    const manifestCall = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/${id}/manifest.json`)
+    expect(JSON.parse(manifestCall[1]).name).toBe('My Cool Project')
+  })
+
+  // After the immediate create-save, the session is migrated (content.json exists)
+  // so a follow-up rename probes content.json — the standard Gen-3 sync path — and
+  // re-writes the manifest with the new name (criterion 1: manifest is identity).
+  test('renameSession after immediate-create probes content.json and updates the manifest', async () => {
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url.endsWith('/index.json')) return notFound()
+      return notFound()
+    })
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    await hook.createNewSession()
+    const id = hook.activeSessionId.value
+    expect(id).toBeTruthy()
+
+    // content.json now exists on the pod — the rename probe should hit it.
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url === `${ROOT}/${id}/content.json`) return jsonResponse(contentDoc(id, 'seeded'))
+      return notFound()
+    })
+    vi.clearAllMocks()
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url === `${ROOT}/${id}/content.json`) return jsonResponse(contentDoc(id, 'seeded'))
+      return notFound()
+    })
+
+    await hook.renameSession(id, 'Renamed Project')
 
     const contentJsonProbes = mockHyperFetch.mock.calls
       .filter(([u]) => u === `${ROOT}/${id}/content.json`)
-    expect(contentJsonProbes).toHaveLength(0) // no probe fired
+    expect(contentJsonProbes.length).toBeGreaterThan(0)
+    const manifestCall = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/${id}/manifest.json`)
+    expect(manifestCall).toBeTruthy()
+    expect(JSON.parse(manifestCall[1]).name).toBe('Renamed Project')
     // index.json IS written (live UI rename captured in the catalog).
     expect(mockUploadFile.mock.calls.some(([u]) => u === `${ROOT}/index.json`)).toBe(true)
+  })
+
+  // RENAME-SAFETY (Cycle 067 criterion 3): renaming the OPEN project rewrites the
+  // seeded `# <oldName>` heading in place — no stale line, no duplicate line.
+  test('renameSession rewrites the seeded heading of the open project in place', async () => {
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+
+    await hook.createNewSession({ name: 'First Name' })
+    const id = hook.activeSessionId.value
+    expect(docRef.value.startsWith('# First Name')).toBe(true)
+
+    await hook.renameSession(id, 'Second Name')
+
+    // Heading updated in place; exactly ONE name line (no duplicate).
+    expect(docRef.value.startsWith('# Second Name')).toBe(true)
+    expect(docRef.value).not.toContain('# First Name')
+    const headingLines = docRef.value.split('\n').filter(l => l.startsWith('# '))
+    expect(headingLines).toHaveLength(1)
+  })
+
+  // RENAME-SAFETY: if the user EDITED the heading, rename leaves the body alone —
+  // never appends a second name line.
+  test('renameSession does NOT touch the body when the seeded heading was edited', async () => {
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+
+    await hook.createNewSession({ name: 'Seeded' })
+    const id = hook.activeSessionId.value
+
+    // User rewrites the heading to their own text.
+    const userEdited = '# My own title\n\nsome notes'
+    docRef.value = userEdited
+
+    await hook.renameSession(id, 'New Catalog Name')
+
+    // Body untouched — no duplicate name line injected.
+    expect(docRef.value).toBe(userEdited)
   })
 
   // After the first saveCurrentSession(), the session is no longer "fresh" —
