@@ -222,6 +222,16 @@ const sessionList = ref([])
 const activeSessionId = ref(null)
 const indexLoading = ref(false)
 const indexLoadError = ref(null)
+// indexLoaded — true once loadIndex() has run to completion (success OR a clean
+// "first use" empty), false until then. The login-clobber guard (Cycle 067 P0
+// regression fix, 2026-06-04): App.vue's Layer 1 auto-create-session must NEVER
+// fire before this is true, because firing while sessionList is still its boot-
+// time empty [] would write a single-entry index.json over the user's real
+// catalog. A bare `sessionList.length === 0` check is NOT sufficient — the list
+// is also empty DURING the load window before hydration. Gating auto-create on
+// `indexLoaded === true && sessionList.length === 0` distinguishes "genuinely a
+// new user" from "index not loaded yet". Reset by _resetModuleStateForTesting.
+const indexLoaded = ref(false)
 const sessionSaving = ref(false)
 const sessionSaveError = ref(null)
 // Non-blocking error surface for delete failures (BareFileSave 2026-05-23).
@@ -416,6 +426,7 @@ export function _resetModuleStateForTesting() {
   activeSessionId.value = null
   indexLoading.value = false
   indexLoadError.value = null
+  indexLoaded.value = false
   sessionSaving.value = false
   sessionSaveError.value = null
   sessionDeleteError.value = null
@@ -831,13 +842,73 @@ export function useSessionIndex({ document }) {
       ) {
         indexLoadError.value = 'Could not load session index from TwinPod.'
         sessionList.value = []
+        // indexLoaded stays false — a real load error is NOT a confirmed
+        // "first use" empty. App.vue's auto-create guard keys on indexLoaded,
+        // so leaving it false here prevents an auto-create from clobbering a
+        // catalog that merely failed to read (transient 5xx / network blip).
         return
       }
 
+      // SELF-HEALING RECOVERY (Cycle 067 P0 regression fix, 2026-06-04).
+      //
+      // The Cycle-066 guarantee is that each project's in-folder manifest.json is
+      // the SOURCE OF TRUTH for its identity and index.json is a DERIVED catalog.
+      // Apply that on the read path: scan the per-project Gen-3 folders and UNION
+      // any manifest whose id is NOT already in `merged` into the catalog. This
+      // recovers a user whose index.json was lost / emptied / PARTIALLY clobbered
+      // — e.g. tst-jack, whose index.json was overwritten with a single spurious
+      // empty entry while N real project folders survived — on their very next
+      // login, with NO data loss.
+      //
+      // Why union-always, not only-when-empty: the observed clobber writes a
+      // ONE-entry index.json (createNewSession appends to the boot-empty list then
+      // PUTs it), so the realistic damaged state is `[1 spurious entry]` — NOT
+      // empty. Gating recovery on "merged is empty" would never fire for that
+      // state and tst-jack would stay broken. Unioning every login covers
+      // missing / empty / partial uniformly (the brief's 3b "missing/partial/
+      // empty" requirement).
+      //
+      // Conflict rule: an EXISTING index entry WINS over a manifest for the same id
+      // (the index carries the live name/lastModified the UI just rendered); only
+      // manifest-only ids are added. So a healthy login is unchanged except for
+      // additive recovery — the union can never shrink or rename a correctly-loaded
+      // project. Genuinely-new users (no folders) get an empty scan → no fabricated
+      // entries. The scan is READ-ONLY; the recovered catalog is persisted by the
+      // next save (or by an explicit saveIndex), not written here.
+      //
+      // Cost: one ur.listContainer + N manifest GETs per login. Acceptable for a
+      // P0 data-recovery; a future optimisation could write-back the unioned index
+      // once so steady-state logins skip the scan.
+      try {
+        const rebuilt = await rebuildIndexFromManifests()
+        if (Array.isArray(rebuilt)) {
+          let recovered = 0
+          for (const entry of rebuilt) {
+            if (!merged.has(entry.id)) {
+              merged.set(entry.id, { ...entry, project: entry.project ?? 'The Brain' })
+              recovered++
+            }
+          }
+          if (recovered > 0) {
+            console.info(
+              `[useSessionIndex] recovered ${recovered} project(s) from per-folder manifests not present in index.json (self-healing derived-catalog union).`
+            )
+          }
+        }
+      } catch (e) {
+        // Best-effort recovery — a failed scan leaves the index-derived list as-is.
+        console.warn('[useSessionIndex] self-healing manifest union failed (best-effort):', e)
+      }
+
       sessionList.value = Array.from(merged.values())
+      // A clean load (success or confirmed first-use empty) — auto-create may
+      // now run safely. Set LAST so it is only true once sessionList holds the
+      // authoritative (possibly rebuilt) catalog.
+      indexLoaded.value = true
     } catch {
       indexLoadError.value = 'Could not load session index from TwinPod.'
       sessionList.value = []
+      // indexLoaded stays false on a thrown error — see the early-return note.
     } finally {
       indexLoading.value = false
     }
@@ -2067,6 +2138,7 @@ export function useSessionIndex({ document }) {
     activeSessionId,
     indexLoading,
     indexLoadError,
+    indexLoaded,
     sessionSaving,
     sessionSaveError,
     sessionDeleteError,
