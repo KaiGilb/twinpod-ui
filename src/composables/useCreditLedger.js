@@ -186,41 +186,50 @@ const INITIAL_FREE_CREDITS = 150
 
 /**
  * Ensure a Solid LDP container exists at containerUrl.
- * Issues a HEAD to check; if absent (404), creates it via PUT with Link type header.
- * No-op if already exists.
+ * Issues a HEAD to check; if absent (404), creates it via PUT with the AUTHORITATIVE
+ * captured wire recipe so the container gets a CLEAN display label (no leading comma
+ * in the LaunchPad). No-op if already exists. Best-effort: warn-and-continue, never throw.
  *
- * Cycle 19 follow-up #9 (2026-04-27): added optional { slug, label } options so
- * containers created on TwinPod display with a human-readable name in the
- * SystemTwin™ app tree. Without these, an empty-Turtle PUT lands as a generic
- * BasicContainer that the SystemTwin™ app labels with a derived dotted-prefix
- * name (e.g. `_TomTwin.apps_`). With Slug + rdfs:label the app shows the proper
- * name (e.g. "TomTwin" / "The Brain (Tom Twin) — App Data"). See
- * Reference_Code_TwinPod-DefaultContainers.md § Companion quirk.
+ * AUTHORITATIVE RECIPE (Cycle 066-extended, 2026-06-04 — matches the sibling fix in
+ * useSessionIndex.js `_ensureContainer`, commit baa3963):
+ *   PUT <containerUrl>            ← trailing slash (the LDP container signal)
+ *   Content-Type: text/turtle
+ *   body: `<> rdfs:label "<Name>" .`   ← bare triple; NO `@prefix rdfs:` line
+ *   → 200
+ *   NO Slug header.
+ *
+ * Source: live wire-capture of the production Accelerator (twinpod.eu/app, 2026-06-03 —
+ * Reference_Code_TwinPod-AcceleratorWireMap.md § "Create a folder (container)"). The
+ * label triple is what clears the leading comma the LaunchPad renders for an unlabeled
+ * container (FRED-LAUNCHPAD-LABEL-1 getLabel array-coercion bug). This SUPERSEDES the
+ * earlier `{ slug, label }` + `@prefix rdfs:` form:
+ *   - Slug on a PUT TO a container URL creates a CHILD container INSIDE it (the
+ *     nested-doubling bug), so the Slug header is removed entirely.
+ *   - The body is the bare captured wire `<> rdfs:label "<Name>" .` (rdfs: is a
+ *     server-recognized default prefix), NOT the `@prefix rdfs:` form.
+ * The `Link: BasicContainer` header is harmless and kept (matches the proven sibling).
  *
  * @param {string} containerUrl - URL ending with /
  * @param {Function} authenticatedFetch - session.fetch from caller
- * @param {Object} [opts]
- * @param {string} [opts.slug] - Slug header (display name hint for SystemTwin™ tree)
- * @param {string} [opts.label] - rdfs:label literal written into the container's Turtle body
+ * @param {string} label - rdfs:label literal written into the container's Turtle body
+ *   (the friendly display name shown in the LaunchPad tree). Quotes are escaped.
  */
-async function ensureContainer(containerUrl, authenticatedFetch, opts = {}) {
+async function ensureContainer(containerUrl, authenticatedFetch, label) {
   try {
     const check = await authenticatedFetch(containerUrl, { method: 'HEAD' })
     if (check.ok || check.status === 200) return // already exists
     if (check.status !== 404) return // unexpected — don't attempt to create
-    // Create the container
-    const headers = {
-      'Content-Type': 'text/turtle',
-      'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
-    }
-    if (opts.slug) headers['Slug'] = opts.slug
-    const body = opts.label
-      ? `@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "${opts.label.replace(/"/g, '\\"')}" .`
-      : ''
+    // Captured wire body — the bare `<> rdfs:label "<Name>" .` triple. No @prefix line
+    // (rdfs: is a server-recognized default), matching the production Accelerator capture.
+    const safeLabel = String(label ?? '').replace(/"/g, '\\"')
     await authenticatedFetch(containerUrl, {
       method: 'PUT',
-      headers,
-      body
+      headers: {
+        'Content-Type': 'text/turtle',
+        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+        // NO Slug header — Slug on PUT creates a child INSIDE the container, not AT the URL.
+      },
+      body: `<> rdfs:label "${safeLabel}" .` // captured Accelerator recipe — sets the clean container name
     })
   } catch (e) {
     console.warn('[useCreditLedger] ensureContainer failed for', containerUrl, e)
@@ -342,8 +351,8 @@ export function useCreditLedger() {
           // applyPendingCredits ensures any of those queued just after will
           // see this grant landed before they try to read-modify-write.
           try {
-            await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
-            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+            await ensureContainer(podRoot + '/apps/', fetcher, 'Apps')
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, 'TomTwin')
             await _enqueueLedgerWrite({
               resourceKey: ledgerUrl,
               label: 'creditLedger-whitelistGrant',
@@ -392,8 +401,8 @@ export function useCreditLedger() {
           // Write the initial ledger to the pod so subsequent logins load it normally.
           // Routed through the queue — same resourceKey as the other three paths.
           try {
-            await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
-            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+            await ensureContainer(podRoot + '/apps/', fetcher, 'Apps')
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, 'TomTwin')
             await _enqueueLedgerWrite({
               resourceKey: ledgerUrl,
               label: 'creditLedger-whitelistInitial',
@@ -442,8 +451,8 @@ export function useCreditLedger() {
           // same as the whitelist branch above. DPoP write happens here (frontend)
           // because the Worker cannot make DPoP-authenticated pod writes.
           try {
-            await ensureContainer(podRoot + '/apps/', fetcher, { slug: 'apps', label: 'Apps' })
-            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+            await ensureContainer(podRoot + '/apps/', fetcher, 'Apps')
+            await ensureContainer(podRoot + '/apps/TomTwin/', fetcher, 'TomTwin')
             await _enqueueLedgerWrite({
               resourceKey: ledgerUrl,
               label: 'creditLedger-freeTrialInitial',
@@ -638,8 +647,8 @@ export function useCreditLedger() {
 
       if (didUpdate) {
         // Ensure parent containers exist before writing
-        await ensureContainer(_podRoot + '/apps/', authenticatedFetch, { slug: 'apps', label: 'Apps' })
-        await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+        await ensureContainer(_podRoot + '/apps/', authenticatedFetch, 'Apps')
+        await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, 'TomTwin')
 
         // Route through the queue (BareFileSave Group 5 — same resourceKey as
         // the other three paths so all four FIFO-serialise).
@@ -803,8 +812,8 @@ export function useCreditLedger() {
       }
 
       // Ensure parent containers exist
-      await ensureContainer(_podRoot + '/apps/', authenticatedFetch, { slug: 'apps', label: 'Apps' })
-      await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, { slug: 'TomTwin', label: 'The Brain (Tom Twin) — App Data' })
+      await ensureContainer(_podRoot + '/apps/', authenticatedFetch, 'Apps')
+      await ensureContainer(_podRoot + '/apps/TomTwin/', authenticatedFetch, 'TomTwin')
 
       const updated = { ...existing, trialUsed: true, trialStartedAt: ts, updatedAt: new Date().toISOString() }
       // Route through the queue (BareFileSave Group 5 — shared resourceKey).

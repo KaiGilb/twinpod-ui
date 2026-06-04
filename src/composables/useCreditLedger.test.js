@@ -287,6 +287,78 @@ describe('useCreditLedger — credit-based free-trial grant (item 7)', () => {
 
 })
 
+// Apps-container clean-label fix (Cycle 066-extended, 2026-06-04) — the
+// /apps/TomTwin/ container must be created with the AUTHORITATIVE captured wire
+// recipe so the LaunchPad shows a clean label (no leading-comma ",TomTwin,apps,").
+// Mirrors the sibling fix in useSessionIndex.js _ensureContainer (commit baa3963).
+//
+// The local ensureContainer issues HEAD first; on 404 it PUTs the container with
+// Content-Type: text/turtle, body `<> rdfs:label "<Name>" .`, NO Slug header,
+// trailing-slash URL. The PUT goes through the authenticatedFetch passed by the
+// caller (NOT ur.ensureContainer — that mock is unused scaffolding here).
+describe('useCreditLedger — /apps/TomTwin/ container clean-label PUT (Cycle 066-extended)', () => {
+
+  // authenticatedFetch that: GET → 404 ledger (first-time user, drives the grant
+  // branch which calls ensureContainer); HEAD → 404 (container missing, drives the
+  // create PUT); PUT (container) → 201. The ledger JSON PUT goes through ur.uploadJSON,
+  // not this fetch, so it is not seen here.
+  function makeContainerAwareFetch() {
+    return vi.fn(async (url, opts = {}) => {
+      if (opts.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts.method === 'PUT') return { ok: true, status: 201 }
+      // GET ledger → 404 (no ledger yet) so the whitelist-initial branch fires.
+      return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}) }
+    })
+  }
+
+  test('whitelisted first-time user → /apps/TomTwin/ PUT body is `<> rdfs:label "TomTwin" .`, text/turtle, NO Slug, trailing slash', async () => {
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+
+    const podRoot = 'https://tst-plannereu.twinpod.eu'
+    const auth = makeContainerAwareFetch()
+    mockUploadJSON.mockResolvedValueOnce({ ok: true, status: 200 })
+
+    const { loadCredits } = useCreditLedger()
+    await loadCredits(podRoot, 'tok', auth, podRoot + '/i')
+
+    // Find the PUT to the /apps/TomTwin/ container (order-independent).
+    const tomTwinPut = auth.mock.calls.find(
+      ([u, o]) => u === podRoot + '/apps/TomTwin/' && o?.method === 'PUT'
+    )
+    expect(tomTwinPut).toBeDefined()
+    const [putUrl, putInit] = tomTwinPut
+
+    // Trailing slash (LDP container signal).
+    expect(putUrl.endsWith('/')).toBe(true)
+    // Bare captured-wire body — no @prefix line, label is the path segment "TomTwin".
+    expect(putInit.body).toBe('<> rdfs:label "TomTwin" .')
+    // text/turtle content type.
+    expect(putInit.headers['Content-Type']).toBe('text/turtle')
+    // NO Slug header — Slug on PUT creates a child INSIDE the container (doubling bug).
+    expect('Slug' in putInit.headers).toBe(false)
+  })
+
+  test('parent /apps/ container is labeled "Apps" (default pod container name)', async () => {
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+
+    const podRoot = 'https://tst-plannereu.twinpod.eu'
+    const auth = makeContainerAwareFetch()
+    mockUploadJSON.mockResolvedValueOnce({ ok: true, status: 200 })
+
+    const { loadCredits } = useCreditLedger()
+    await loadCredits(podRoot, 'tok', auth, podRoot + '/i')
+
+    const appsPut = auth.mock.calls.find(
+      ([u, o]) => u === podRoot + '/apps/' && o?.method === 'PUT'
+    )
+    expect(appsPut).toBeDefined()
+    const [, putInit] = appsPut
+    expect(putInit.body).toBe('<> rdfs:label "Apps" .')
+    expect('Slug' in putInit.headers).toBe(false)
+  })
+
+})
+
 describe('useCreditLedger — Group 5 queue routing (BareFileSave 2026-05-23)', () => {
 
   test('Guard C — localStorage backup is written BEFORE enqueue and cleared on success', async () => {
