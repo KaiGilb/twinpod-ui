@@ -24,9 +24,7 @@ import { ref } from 'vue'
 
 const mockHyperFetch = vi.fn()
 const mockUploadFile = vi.fn()
-const mockPatchInsert = vi.fn().mockResolvedValue(undefined)
 const mockListContainer = vi.fn()
-const mockEnsureContainer = vi.fn().mockResolvedValue(undefined)
 const mockEnqueueSave = vi.fn()
 const mockDeleteURI = vi.fn().mockResolvedValue(true)
 const _saveListeners = new Set()
@@ -35,9 +33,7 @@ vi.mock('@kaigilb/twinpod-client', () => ({
   ur: {
     hyperFetch: mockHyperFetch,
     uploadFile: mockUploadFile,
-    patchInsert: mockPatchInsert,
     listContainer: mockListContainer,
-    ensureContainer: mockEnsureContainer,
     enqueueSave: mockEnqueueSave,
     deleteURI: mockDeleteURI,
     onSaveEvent: vi.fn((fn) => {
@@ -105,7 +101,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   _saveListeners.clear()
   _store.clear()
-  mockEnsureContainer.mockResolvedValue(undefined)
   mockDeleteURI.mockResolvedValue(true)
   mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
   mockListContainer.mockResolvedValue([])
@@ -430,5 +425,38 @@ describe('useSessionIndex — Cycle 066-extended DEEP self-contained project fol
     const manifestCall = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/${id}/manifest.json`)
     expect(manifestCall).toBeTruthy()
     expect(JSON.parse(manifestCall[1]).project).toBe('NoteWorld')
+  })
+
+  // WRITE-ORDER DISCIPLINE (Cycle 066-extended rev3, 2026-06-04) — manifest.json
+  // must be written BEFORE content.json inside saveCurrentSession so that on
+  // strict-LDP pods (tst-planlegger.twinpod.eu) the manifest PUT auto-materializes
+  // the <id>/ container, allowing the subsequent content.json PUT to succeed.
+  //
+  // This replaces the prior ensureContainer approach (dce9ccf) which used
+  // text/turtle + BasicContainer Link header — broken post-2026-05-30.
+  test('saveCurrentSession: manifest.json is PUT before content.json (write-order discipline)', async () => {
+    const id = 'write-order-9999'
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url.endsWith('/index.json')) return notFound()
+      return notFound()
+    })
+    mockUploadFile.mockResolvedValue({ ok: true, status: 201 })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('hello')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.sessionList.value = [{ id, name: 'Write Order Test', project: 'The Brain', lastModified: new Date().toISOString() }]
+    hook.activeSessionId.value = id
+
+    await hook.saveCurrentSession('Write Order Test')
+
+    const putUrls = mockUploadFile.mock.calls.map(([u]) => u)
+    const manifestIdx = putUrls.indexOf(`${ROOT}/${id}/manifest.json`)
+    const contentIdx = putUrls.indexOf(`${ROOT}/${id}/content.json`)
+
+    expect(manifestIdx).toBeGreaterThan(-1)   // manifest was written
+    expect(contentIdx).toBeGreaterThan(-1)    // content was written
+    expect(manifestIdx).toBeLessThan(contentIdx) // manifest FIRST, then content
   })
 })

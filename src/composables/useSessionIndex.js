@@ -65,10 +65,12 @@
  *
  * Subdirectory support: CONFIRMED via Cycle 12 (LDP BasicContainer PUT to
  * {podRoot}/home/TomTwin/ succeeded). The /home/TomTwinProjects/ container and
- * each <id>/ project folder are pre-created via _ensureContainer before the first
- * file write (HEAD-check → 404 → PUT with BasicContainer Link header + rdfs:label).
- * This is a no-op on pods that auto-materialize (demo.systemtwin.com, tst-plannereu)
- * and prevents 409 Conflict on strict-LDP pods (tst-planlegger.twinpod.eu).
+ * each <id>/ project folder are auto-materialized by write-order discipline: each
+ * write targets a path exactly ONE level below an already-existing container.
+ *   Step 1: PUT index.json → TomTwinProjects/ auto-materializes (one level into /home/).
+ *   Step 2: PUT <id>/manifest.json → <id>/ auto-materializes (one level into TomTwinProjects/).
+ *   Step 3: PUT <id>/content.json → <id>/ already exists.
+ * No text/turtle BasicContainer PUT required. Confirmed working on tst-planlegger.twinpod.eu.
  *
  * @param {{ document: import('vue').Ref<string> }} workbookRefs
  *   An object containing the shared document ref from useWorkspace. Passed in
@@ -178,6 +180,31 @@ const MANIFEST_SCHEMA_VERSION = 1
 // is never read to make an access decision. A receiving pod may later populate it.
 const MANIFEST_OWNER_PLACEHOLDER = null
 
+// WRITE-ORDER DISCIPLINE (Cycle 066-extended rev3, 2026-06-04)
+// ---------------------------------------------------------------
+// tst-planlegger.twinpod.eu (strict LDP) returns 409 Conflict when a file PUT
+// targets a path whose immediate parent container does not yet exist.
+//
+// The fix is write-order discipline — each write targets a path exactly ONE LEVEL
+// below an already-existing container. One-level PUTs auto-materialize the parent:
+//
+//   Step 1: PUT {root}/index.json          → TomTwinProjects/ auto-materializes
+//           (TomTwinProjects/ is one level into /home/, which always exists).
+//   Step 2: PUT {root}/<id>/manifest.json  → <id>/ auto-materializes
+//           (one level into TomTwinProjects/, which now exists after Step 1).
+//   Step 3: PUT {root}/<id>/content.json   → <id>/ already exists.
+//
+// This replaces the prior _ensureContainer approach (dce9ccf) which used
+// text/turtle PUT + BasicContainer Link header — broken on tst-planlegger
+// post-2026-05-30 (Fred removed the turtle-into-pod hack).
+//
+// Invariants:
+//   - saveIndex() (which writes index.json) must complete before any <id>/ write.
+//     createNewSession() awaits saveIndex() before returning; the autosave debounce
+//     (180 s) cannot fire before that. No additional guard needed.
+//   - saveCurrentSession() writes manifest.json BEFORE content.json. manifest.json
+//     auto-materializes <id>/; content.json then lands cleanly.
+
 // Module-level state so App.vue and all injected children share the same reactive refs.
 const sessionList = ref([])
 const activeSessionId = ref(null)
@@ -249,33 +276,6 @@ let _lastSavedContent = ''
 // redirect saves go through ensureSessionSaved (Guard B) which awaits
 // saveCurrentSession directly without needing a timer ref.
 
-// --- Container pre-creation (Cycle 066-extended rev2, 2026-06-04) ---
-//
-// tst-planlegger.twinpod.eu returns 409 Conflict when a PUT targets a path
-// whose parent container does not yet exist (unlike demo.systemtwin.com and
-// tst-plannereu which auto-materialize on the first deep-path write). The fix
-// is to HEAD-check and, on 404, PUT the container before writing any file into
-// it. This is FIRE-AND-FORGET: failures are logged as warnings but NEVER block
-// the save path — the app continues to work on pods that auto-materialize.
-//
-// Two levels must be pre-created:
-//   1. TomTwinProjects/ — before first saveIndex() (root container).
-//   2. <id>/            — before first content.json PUT (project container).
-//
-// Preconditions for ensureContainer: window.solid.session must be authenticated
-// (the same precondition as all other pod I/O in this composable).
-//
-// Single-namespace rule exception: ur.uploadFile uses ur.hyperFetch which only
-// sets Content-Type. The BasicContainer Link header CANNOT be added through
-// ur.uploadFile. window.solid.session.fetch is therefore used here explicitly —
-// matching the established precedent in useCreditLedger.js. The fetch is only
-// issued for ensureContainer (HEAD + conditional PUT) and for no other purpose.
-//
-// _rootContainerEnsured: once-per-session guard for the TomTwinProjects/ level.
-// _projectContainersEnsured: Set of <id> values whose folders have been ensured.
-let _rootContainerEnsured = false
-const _projectContainersEnsured = new Set()
-
 // _freshSessions: IDs minted by createNewSession() this session but not yet
 // persisted to content.json. syncManifestIfMigrated() skips the probe for
 // these — content.json does not exist yet so the GET would always 404,
@@ -334,8 +334,6 @@ export function _resetModuleStateForTesting() {
   _autosaveTimer = null
   _lastSavedContent = ''
   _sessionMeta.clear()
-  _rootContainerEnsured = false
-  _projectContainersEnsured.clear()
   _freshSessions.clear()
 }
 
@@ -499,46 +497,6 @@ export function useSessionIndex({ document }) {
   // --- Internal helpers ---
 
   /**
-   * Best-effort fire-and-forget sparql-update PATCH to set rdfs:label on a
-   * container. NEVER throws. NEVER blocks the caller. Logs a warning on failure.
-   *
-   * Per the Writes standard §1.1: "data ABOUT an existing resource" targets the
-   * HEAD-checks containerUrl; if absent (404), PUTs it as an LDP BasicContainer
-   * with an rdfs:label turtle body. No-op when HEAD returns 200 (already exists).
-   * Best-effort — logs a warning on failure and never blocks the save path.
-   *
-   * Uses window.solid.session.fetch directly (single-namespace exception): the
-   * BasicContainer Link header cannot be added via ur.uploadFile (hyperFetch only
-   * sets Content-Type). This matches the established precedent in useCreditLedger.js.
-   *
-   * @param {string} containerUrl   - Container URL ending with /
-   * @param {string} label          - rdfs:label literal for the new container
-   * @param {string} [slug]         - Slug header hint (display name for SystemTwin tree)
-   * @returns {Promise<void>}
-   */
-  async function _ensureContainer(containerUrl, label, slug) {
-    if (!containerUrl) return
-    try {
-      const fetch = window?.solid?.session?.fetch
-      if (!fetch) return
-      const check = await fetch(containerUrl, { method: 'HEAD' })
-      if (check.ok || check.status === 200) return // already exists — no-op
-      if (check.status !== 404) return // unexpected status — don't attempt to create
-      const headers = {
-        'Content-Type': 'text/turtle',
-        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
-      }
-      if (slug) headers['Slug'] = slug
-      const body = label
-        ? `@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<> rdfs:label "${label.replace(/"/g, '\\"')}" .`
-        : ''
-      await fetch(containerUrl, { method: 'PUT', headers, body })
-    } catch (e) {
-      console.warn('[useSessionIndex] ensureContainer failed for', containerUrl, e?.message || e)
-    }
-  }
-
-  /**
    * Returns the sessions container URL for the current pod.
    * All paths in this composable build from this string.
    * @returns {string}
@@ -655,29 +613,6 @@ export function useSessionIndex({ document }) {
     }
   }
 
-  // --- Container pre-creation (Cycle 066-extended rev2, 2026-06-04) ---
-  //
-  // tst-planlegger.twinpod.eu (and possibly other strict-LDP pods) returns 409
-  // Conflict when the target container does not exist before a file PUT. The
-  // write-path-only idiom (Cycle 066) works on demo.systemtwin.com and
-  // tst-plannereu (which auto-materialize), but breaks on strict pods.
-  //
-  // Fix: HEAD-check each container before first write; on 404, PUT it as an
-  // LDP BasicContainer with an rdfs:label turtle body. This is a no-op on pods
-  // that already have the container (HEAD → 200) and creates it cleanly on pods
-  // that require explicit pre-creation (HEAD → 404). The label in the PUT body
-  // also sets a clean name so the LaunchPad skips the uri4uri:path fallback that
-  // produces the leading-comma render bug (",TomTwinProjects").
-  //
-  // Note: whether the label body is accepted by the server is empirical — the
-  // quirks file records that tst-plan silently drops it. On tst-planlegger
-  // (strict-404 pod) the label may stick. In either case the 409 is resolved.
-  // FRED-LAUNCHPAD-LABEL-1 (the LaunchPad getLabel array-join fix) remains the
-  // only guaranteed comma fix; the label PUT is defense-in-depth.
-  //
-  // saveIndex() (called by createNewSession) is the first write that targets the
-  // TomTwinProjects/ container — ensureContainer runs before it.
-
   // --- Session ID generation ---
 
   /**
@@ -719,8 +654,8 @@ export function useSessionIndex({ document }) {
     indexLoadError.value = null
 
     // No pre-create step needed for the read path: a missing container reads as
-    // "first use" (primary index 404/empty) below. ensureContainer fires in
-    // createNewSession before the first saveIndex() write.
+    // "first use" (primary index 404/empty) below. Write-order discipline handles
+    // container materialization on the first saveIndex() write in createNewSession.
 
     /**
      * Fetches an index.json from a given root URL.
@@ -978,17 +913,9 @@ export function useSessionIndex({ document }) {
     // programmatic clear as a user edit (Cycle 045 iter-2 change-aware autosave).
     _lastSavedContent = ''
 
-    // Best-effort: pre-create the TomTwinProjects/ container before writing
-    // index.json into it. On pods that auto-materialize (demo.systemtwin.com,
-    // tst-plannereu) this HEAD-checks and no-ops (200). On strict-LDP pods like
-    // tst-planlegger.twinpod.eu it creates the container with a clean label,
-    // preventing the 409 Conflict that would otherwise block saveIndex().
-    // Fire-and-forget — guard is one-time per pod-root per session.
-    if (!_rootContainerEnsured && _podRoot) {
-      _rootContainerEnsured = true
-      await _ensureContainer(sessionsRoot() + '/', 'TomTwinProjects', 'TomTwinProjects')
-    }
-
+    // Write-order discipline: saveIndex() writes index.json ONE LEVEL into /home/,
+    // which auto-materializes TomTwinProjects/ on strict-LDP pods (tst-planlegger).
+    // No explicit container pre-creation needed — the grandparent /home/ always exists.
     await saveIndex()
   }
 
@@ -1125,16 +1052,23 @@ export function useSessionIndex({ document }) {
     // ──────────────────────────────────────────────────────────────────────────
 
     try {
-      // Pre-create the <id>/ project folder before writing content.json into it.
-      // On pods that auto-materialize (demo, tst-plannereu) this no-ops (HEAD → 200).
-      // On strict-LDP pods (tst-planlegger) it creates the container with a clean
-      // label, preventing the 409 Conflict on the content.json PUT that follows.
-      // Guard: only attempt once per id per session (Set tracks attempted ids).
-      // await to confirm the container exists before the content PUT — the whole
-      // point is to unblock the PUT that follows.
-      if (!_projectContainersEnsured.has(id)) {
-        _projectContainersEnsured.add(id)
-        await _ensureContainer(folderUrl(id), resolvedName, id)
+      // Write-order discipline (Cycle 066-extended rev3, 2026-06-04):
+      // manifest.json FIRST, content.json SECOND.
+      //
+      // On tst-planlegger.twinpod.eu (strict LDP), writing a file one level into an
+      // existing container auto-materializes that container. TomTwinProjects/ exists
+      // after saveIndex() (Step 1 of createNewSession). Writing manifest.json into
+      // TomTwinProjects/<id>/ is one level deep → auto-materializes <id>/. The
+      // subsequent content.json PUT lands in an already-existing <id>/ → no 409.
+      //
+      // Failure semantics: manifest failure is non-fatal (surfaced, isDirty NOT
+      // restored — the content write has not happened yet, so retrying saves both).
+      // Content failure restores isDirty so the autosave re-queues.
+      const manifestResponse = await ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json')
+      if (!manifestResponse.ok) {
+        // Non-fatal: log and continue. content.json write still proceeds.
+        // The next save will re-PUT the manifest alongside the content.
+        sessionSaveError.value = `Could not save project manifest (HTTP ${manifestResponse.status || 0}). Will retry on next save.`
       }
 
       const fileResponse = await ur.uploadFile(sessionFileUrl, body, 'application/json')
@@ -1149,19 +1083,6 @@ export function useSessionIndex({ document }) {
       // syncManifestIfMigrated() will probe on the NEXT rename (e.g. user renames
       // an existing project from the list) and correctly finds content.json.
       _freshSessions.delete(id)
-
-      // Write the manifest.json alongside content.json INSIDE the project folder.
-      // This is what makes the folder self-contained + portable: the manifest lets a
-      // receiving pod rebuild this project's catalog entry without the user's
-      // index.json. It is written AFTER the content PUT succeeds (the content is the
-      // user's work and gates isDirty; the manifest is derived identity metadata). A
-      // manifest write that fails does NOT restore isDirty — the content is safe and
-      // the next save re-PUTs the manifest — but the failure is surfaced so it is not
-      // silent.
-      const manifestResponse = await ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json')
-      if (!manifestResponse.ok) {
-        sessionSaveError.value = `Saved content, but could not save project manifest (HTTP ${manifestResponse.status || 0}).`
-      }
 
       // Successful save — update meta. Clear the legacy-loaded flag so future loads
       // resolve from the Gen-3 folder rather than the legacy loose-file fallback.
