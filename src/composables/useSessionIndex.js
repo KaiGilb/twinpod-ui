@@ -1145,13 +1145,34 @@ export function useSessionIndex({ document }) {
     document.value = seeded
     _lastSavedContent = seeded
 
-    // Immediate persist (Cycle 067): write the project's folder + manifest.json +
-    // content.json to the pod NOW via saveCurrentSession — which also writes
-    // index.json and clears the id from _freshSessions on success. This replaces
-    // the prior saveIndex()-only create path; we do NOT call saveIndex() as well
-    // (saveCurrentSession calls it internally). The container-ensure for
-    // TomTwinProjects/ and <id>/ happens inside saveCurrentSession.
-    await saveCurrentSession(name)
+    // Non-blocking immediate persist (Cycle 067 rev2, 2026-06-04): route the
+    // create-time pod write through the canonical background-save queue
+    // (enqueueWorkbookSave → ur.enqueueSave) rather than awaiting it inline.
+    //
+    // WHY non-blocking, not deferred: the optimistic state above (sessionList +
+    // active + seeded document) is already set, so the user sees and can use the
+    // new project the instant createNewSession resolves — it no longer blocks on
+    // a chain of ~5 sequential pod round-trips (container-ensures + manifest PUT +
+    // content PUT + index PUT). enqueueWorkbookSave returns synchronously but the
+    // queue's _drain fires the save task IMMEDIATELY (same microtask), so the
+    // write still hits the pod promptly — this is "non-blocking", NOT "wait for an
+    // idle/lifecycle event". Step A's immediate-persist guarantee (folder +
+    // manifest.json + content.json land on the pod right after create) holds.
+    //
+    // saveCurrentSession (run by the queue task) still writes manifest.json +
+    // content.json + index.json in the container-ensured order and clears the id
+    // from _freshSessions on its first successful content.json write. Taking
+    // saveIndex() off the create critical path (brief fix 3) falls out for free:
+    // the whole save task — including its internal saveIndex() — now runs in the
+    // background, never blocking create. The index remains rebuildable from the
+    // per-folder manifests (P0 self-heal), so a deferred index write is safe.
+    //
+    // Guard C: enqueueWorkbookSave writes the localStorage backup synchronously
+    // BEFORE enqueueing, so a create whose background write fails is recoverable
+    // at next boot and re-tried by autosave (saveCurrentSession restores isDirty
+    // on content-write failure). The queue serialises FIFO per contentUrl(id), so
+    // this create-save and any later autosave of the same project cannot race.
+    enqueueWorkbookSave(name)
   }
 
   /**
@@ -1312,26 +1333,54 @@ export function useSessionIndex({ document }) {
         if (ok) _projectContainersEnsured.add(id)
       }
 
-      // Write manifest.json BEFORE content.json (belt-and-suspenders write order).
-      // On lenient pods without _ensureContainer the manifest PUT auto-materialises
-      // <id>/; on strict pods the _ensureContainer above already created it.
+      // Write manifest.json + content.json IN PARALLEL (Cycle 067 rev2,
+      // 2026-06-04). These two PUTs are independent resources under the same
+      // already-ensured <id>/ container, so issuing them concurrently halves the
+      // write latency on the create critical path versus the prior strict
+      // sequence. The manifest-first write-order is no longer required: the
+      // _ensureContainer guard above (rev4) creates the <id>/ container before
+      // EITHER PUT, so "manifest auto-materialises the container for content" is
+      // redundant belt-and-suspenders, and on lenient pods either PUT
+      // auto-materialises equally.
       //
-      // Failure semantics: manifest failure is non-fatal (surfaced, isDirty NOT
-      // restored — the content write has not happened yet, so retrying saves both).
-      // Content failure restores isDirty so the autosave re-queues.
-      const manifestResponse = await ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json')
-      if (!manifestResponse.ok) {
-        // Non-fatal: log and continue. content.json write still proceeds.
-        // The next save will re-PUT the manifest alongside the content.
-        sessionSaveError.value = `Could not save project manifest (HTTP ${manifestResponse.status || 0}). Will retry on next save.`
+      // Promise.allSettled (NOT Promise.all) so each result is inspected
+      // INDEPENDENTLY and the original failure semantics are preserved exactly,
+      // including the throw path: ur.uploadFile can THROW on a network error, and
+      // a single Promise.all+catch would let a manifest-only throw restore isDirty
+      // (a regression — manifest failure must stay non-fatal). With allSettled we
+      // map each outcome to ok/throw and apply the per-file rule:
+      //   - content: rejected OR !ok  → restore isDirty (autosave retries) + return.
+      //   - manifest: rejected OR !ok → non-fatal, surface only (isDirty untouched).
+      const [manifestSettled, contentSettled] = await Promise.allSettled([
+        ur.uploadFile(sessionManifestUrl, manifestBody, 'application/json'),
+        ur.uploadFile(sessionFileUrl, body, 'application/json')
+      ])
+
+      // Content-write outcome decides the fatal path. A rejected promise
+      // (network throw) is treated the same as a non-ok HTTP response: restore
+      // isDirty so the autosave re-queues, keep the localStorage backup (NOT
+      // cleared — we return before the clear below), and surface the error.
+      const contentOk = contentSettled.status === 'fulfilled' && contentSettled.value?.ok
+      if (!contentOk) {
+        isDirty.value = true
+        const status = contentSettled.status === 'fulfilled'
+          ? (contentSettled.value?.status || 0)
+          : 0
+        sessionSaveError.value = contentSettled.status === 'rejected'
+          ? 'Could not save session (network error).'
+          : `Could not save session file (HTTP ${status}).`
+        return
       }
 
-      const fileResponse = await ur.uploadFile(sessionFileUrl, body, 'application/json')
-      if (!fileResponse.ok) {
-        // Save failed — restore isDirty so retries happen.
-        isDirty.value = true
-        sessionSaveError.value = `Could not save session file (HTTP ${fileResponse.status || 0}).`
-        return
+      // Manifest-write outcome is NON-FATAL: surfaced but isDirty is NOT restored
+      // (the content write — the authoritative copy — succeeded; the next save
+      // re-PUTs the manifest alongside the content).
+      const manifestOk = manifestSettled.status === 'fulfilled' && manifestSettled.value?.ok
+      if (!manifestOk) {
+        const status = manifestSettled.status === 'fulfilled'
+          ? (manifestSettled.value?.status || 0)
+          : 0
+        sessionSaveError.value = `Could not save project manifest (HTTP ${status}). Will retry on next save.`
       }
 
       // content.json is now on the pod — the session is no longer "fresh".

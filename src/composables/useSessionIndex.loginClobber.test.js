@@ -35,9 +35,22 @@ import { ref } from 'vue'
 const mockHyperFetch = vi.fn()
 const mockUploadFile = vi.fn()
 const mockListContainer = vi.fn()
-const mockEnqueueSave = vi.fn()
+// mockEnqueueSave mirrors the real save-queue _drain (Cycle 067 rev2): fires the
+// task immediately in a microtask but returns synchronously without awaiting —
+// the non-blocking create-save semantics. drainQueue() awaits the in-flight task
+// so a test that inspects the resulting index.json PUT can do so deterministically.
+let _lastSavePromise = null
+let _saveJobCounter = 0
+const mockEnqueueSave = vi.fn(({ task }) => {
+  _lastSavePromise = Promise.resolve().then(() => task())
+  return `mock-save-${++_saveJobCounter}`
+})
 const mockDeleteURI = vi.fn().mockResolvedValue(true)
 const _saveListeners = new Set()
+
+async function drainQueue() {
+  if (_lastSavePromise) await _lastSavePromise
+}
 
 vi.mock('@kaigilb/twinpod-client', () => ({
   ur: {
@@ -101,6 +114,8 @@ beforeEach(() => {
   vi.clearAllMocks()
   _saveListeners.clear()
   _store.clear()
+  _lastSavePromise = null
+  _saveJobCounter = 0
   mockDeleteURI.mockResolvedValue(true)
   mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
   mockListContainer.mockResolvedValue([])
@@ -299,6 +314,15 @@ describe('useSessionIndex — Cycle 067 P0 login-clobber + self-healing recovery
     expect(hook.indexLoaded.value).toBe(false)
 
     await hook.createNewSession()
+    // Cycle 067 rev2: the create-time persist is now NON-BLOCKING (enqueued, fires
+    // immediately, not awaited). Drain the queued write so the index.json PUT it
+    // performs in the background has landed before we inspect it. The CLOBBER
+    // semantics are unchanged — the write still happens promptly; the rev2 change
+    // only moves it off the synchronous create path. The harm (and therefore the
+    // App.vue indexLoaded gate that prevents auto-create from reaching here before
+    // hydration) is identical; rev2 makes the index write resolve LATER, never
+    // earlier, so it is clobber-neutral.
+    await drainQueue()
 
     // index.json was overwritten with ONLY the freshly-minted project — the real
     // catalog (had it been loaded) would have been clobbered. This is the harm the
@@ -328,5 +352,94 @@ describe('useSessionIndex — Cycle 067 P0 login-clobber + self-healing recovery
     expect(hook.indexLoadError.value).toBeTruthy()
     expect(hook.indexLoaded.value).toBe(false)
     expect(hook.sessionList.value).toEqual([])
+  })
+
+  // NO-CLOBBER UNDER THE NEW NON-BLOCKING ORDERING (Cycle 067 rev2 — brief
+  // criterion f). When loadIndex HAS hydrated the catalog (indexLoaded true,
+  // sessionList holds the real projects), a subsequent createNewSession must
+  // APPEND to the catalog and write the FULL list to index.json — it must not
+  // shrink or replace it. The rev2 background routing does not change this: the
+  // optimistic sessionList append happens synchronously before the enqueue, and
+  // the queued save serialises the index PUT of the full list.
+  test('no-clobber: createNewSession after loadIndex hydrates appends to the catalog (full list written, not single entry)', async () => {
+    // Pod holds a real two-project catalog; loadIndex hydrates it.
+    mockHyperFetch.mockImplementation(async (url) => {
+      if (url === `${ROOT}/index.json`) {
+        return jsonResponse([indexEntry('proj-a-1111', 'Alpha'), indexEntry('proj-b-2222', 'Beta')])
+      }
+      return notFound()
+    })
+    mockListContainer.mockResolvedValue([]) // no extra manifest-only folders
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const { useSessionIndex } = await importHook()
+    const hook = useSessionIndex({ document: ref('') })
+    hook.setPodRoot(POD_ROOT)
+
+    await hook.loadIndex()
+    expect(hook.indexLoaded.value).toBe(true)
+    expect(hook.sessionList.value).toHaveLength(2)
+
+    // Now create a new project — the catalog is hydrated, so this is the legitimate
+    // append path, NOT the clobber window.
+    await hook.createNewSession({ name: 'Gamma' })
+    const newId = hook.activeSessionId.value
+
+    // Optimistic append already visible (synchronous, before the enqueue).
+    expect(hook.sessionList.value).toHaveLength(3)
+
+    // Drain the background save and inspect the index.json that was written.
+    await drainQueue()
+    const indexPut = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/index.json`)
+    expect(indexPut).toBeTruthy()
+    const written = JSON.parse(indexPut[1])
+    expect(written).toHaveLength(3) // FULL list — Alpha + Beta + Gamma, no clobber
+    const ids = written.map(e => e.id)
+    expect(ids).toContain('proj-a-1111')
+    expect(ids).toContain('proj-b-2222')
+    expect(ids).toContain(newId)
+  })
+
+  // DEFERRED INDEX WRITE (Cycle 067 rev2 — brief fix 3 / criterion d, composable
+  // level). The index.json PUT is OFF the create critical path: it is performed by
+  // the background save task AFTER the content.json write, never before
+  // createNewSession resolves. Here we gate uploadFile; while gated, createNewSession
+  // has already resolved but NO index.json PUT has been issued yet — proving the
+  // index write does not block create. After release, index.json IS written (it
+  // still happens, just deferred). The indexLoaded gate that protects the catalog
+  // lives upstream in App.vue and is unchanged by this deferral.
+  test('deferred index: createNewSession resolves before any index.json PUT is issued; index still written after drain', async () => {
+    let releaseUploads
+    const gate = new Promise((res) => { releaseUploads = res })
+    const issued = []
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockImplementation(async (url) => {
+      issued.push(url)
+      await gate
+      return { ok: true, status: 200 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const hook = useSessionIndex({ document: ref('') })
+    hook.setPodRoot(POD_ROOT)
+
+    await hook.createNewSession()
+    const id = hook.activeSessionId.value
+
+    // create has resolved; the background task has not run yet → no PUTs issued,
+    // so the index write certainly did NOT block create.
+    expect(issued).not.toContain(`${ROOT}/index.json`)
+
+    // Let the task start and issue its (gated) PUTs.
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    // content + manifest are in flight; index.json comes AFTER content resolves,
+    // so it must still be absent while content is gated.
+    expect(issued).toContain(`${ROOT}/${id}/content.json`)
+    expect(issued).not.toContain(`${ROOT}/index.json`)
+
+    // Release the gate — content resolves, then saveIndex runs in the background.
+    releaseUploads()
+    await drainQueue()
+    expect(mockUploadFile.mock.calls.some(([u]) => u === `${ROOT}/index.json`)).toBe(true)
   })
 })
