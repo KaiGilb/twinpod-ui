@@ -406,6 +406,135 @@ describe('useSessionIndex — Cycle 066-extended DEEP self-contained project fol
     expect(JSON.parse(manifestCall[1]).name).toBe('Renamed After Save')
   })
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // _ensureContainer tests (Cycle 066-extended rev4, 2026-06-04)
+  //
+  // These tests cover the HEAD-first container pre-creation guard introduced to
+  // fix 409 on strict-LDP pods (tst-planlegger, tst-solveig). All four cases
+  // use a mock sessionFetch (the function wired by setSessionFetch in App.vue)
+  // rather than ur.* — _ensureContainer deliberately does NOT route through
+  // ur.uploadFile because that sends JSON headers unsuitable for a container PUT.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  // HEAD-404 → PUT fires: when the container does not exist, ensureContainer issues
+  // a HEAD (→ 404) and then a PUT with the BasicContainer Link header.
+  test('_ensureContainer: HEAD-404 → PUT is issued to create the container', async () => {
+    const id = 'ensure-head404-aaaa'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts?.method === 'PUT') return { ok: true, status: 201 }
+      return { ok: false, status: 404 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: 'Test', project: 'The Brain', lastModified: new Date().toISOString() }]
+
+    await hook.saveCurrentSession('Test')
+
+    // At least one PUT was issued via sessionFetch (not uploadFile) for container creation.
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBeGreaterThan(0)
+    // HEAD was issued first.
+    const headCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'HEAD')
+    expect(headCalls.length).toBeGreaterThan(0)
+  })
+
+  // HEAD-200 → no PUT: when the container already exists, ensureContainer skips the PUT.
+  test('_ensureContainer: HEAD-200 → no PUT is issued (container already exists)', async () => {
+    const id = 'ensure-head200-bbbb'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: true, status: 200 } // container exists
+      return { ok: false, status: 404 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: 'Test', project: 'The Brain', lastModified: new Date().toISOString() }]
+
+    await hook.saveCurrentSession('Test')
+
+    // No PUT should be issued via sessionFetch (container exists → skip).
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls).toHaveLength(0)
+  })
+
+  // Guard prevents double-call: calling saveCurrentSession twice for the same project
+  // only triggers one HEAD + one PUT for the <id>/ container (_projectContainersEnsured).
+  test('_ensureContainer: guard prevents duplicate HEAD+PUT for the same project id', async () => {
+    const id = 'ensure-guard-cccc'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts?.method === 'PUT') return { ok: true, status: 201 }
+      return { ok: false, status: 404 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: 'Test', project: 'The Brain', lastModified: new Date().toISOString() }]
+
+    // First save: containers do not exist → HEAD+PUT fires for TomTwinProjects/ and <id>/.
+    await hook.saveCurrentSession('Test')
+    const callsAfterFirst = mockSessionFetch.mock.calls.length
+
+    // Second save: guards are set → no new HEAD+PUT for either container.
+    await hook.saveCurrentSession('Test')
+    const callsAfterSecond = mockSessionFetch.mock.calls.length
+
+    // No new sessionFetch calls between first and second save (guards fired, skipped).
+    expect(callsAfterSecond).toBe(callsAfterFirst)
+  })
+
+  // PUT failure does not block save: if _ensureContainer's PUT returns an error,
+  // saveCurrentSession continues and the file PUT (via ur.uploadFile) still runs.
+  test('_ensureContainer: PUT failure does not block the file save', async () => {
+    const id = 'ensure-failsafe-dddd'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockResolvedValue({ ok: true, status: 200 })
+
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts?.method === 'PUT') return { ok: false, status: 500 } // simulate server error
+      return { ok: false, status: 404 }
+    })
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('content')
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
+    hook.activeSessionId.value = id
+    hook.sessionList.value = [{ id, name: 'Test', project: 'The Brain', lastModified: new Date().toISOString() }]
+
+    // Should not throw — failure is best-effort.
+    await hook.saveCurrentSession('Test')
+
+    // The file save (manifest + content via uploadFile) still ran despite PUT failure.
+    const contentCall = mockUploadFile.mock.calls.find(([u]) => u === `${ROOT}/${id}/content.json`)
+    expect(contentCall).toBeTruthy()
+  })
+
   // RENAME-PROJECT (grouping label) also syncs the manifest's `project` for a
   // migrated project — the rebuild reconstructs `project` from the manifest.
   // Spec: criterion 2 (rebuild reads project from the manifest).

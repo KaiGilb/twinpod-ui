@@ -283,20 +283,34 @@ describe('useSessionIndex — Cycle 066 TomTwinProjects + dual-read', () => {
     expect(hook.sessionList.value.map(s => s.id)).toContain(legacyOnly)
   })
 
-  // Regression guard for the doubling bug (Cycle 066-extended, 2026-06-04):
-  // commit dce9ccf's _ensureContainer called PUT /home/TomTwinProjects/ with
-  // Slug:TomTwinProjects, which on a strict LDP pod created the nested child
-  // container /home/TomTwinProjects/TomTwinProjects/. That call was removed in
-  // 0f700a2. This test asserts that neither saveIndex nor saveCurrentSession
-  // ever writes to a URL containing the doubled segment, and that no basic-
-  // container PUT is issued (the write-order idiom replaced ensureContainer).
-  test('no write ever targets …/TomTwinProjects/TomTwinProjects/… (doubling regression)', async () => {
+  // Regression guard for the doubling bug (Cycle 066-extended rev4, 2026-06-04):
+  // commit dce9ccf's _ensureContainer called PUT /home/TomTwinProjects/ WITH
+  // Slug: TomTwinProjects, which on a strict LDP pod created the CHILD container
+  // /home/TomTwinProjects/TomTwinProjects/ rather than the container AT the URL.
+  //
+  // The fix (rev4): _ensureContainer uses authenticated session.fetch directly
+  // (NOT ur.uploadFile) and sends NO Slug header. The guard fires via _sessionFetch
+  // (wired by setSessionFetch in App.vue) and does a HEAD then a bare turtle PUT TO
+  // the target URL. This test wires a mock _sessionFetch and asserts:
+  //   1. No uploadFile call (the application JSON writes) targets the doubled segment.
+  //   2. The ensureContainer PUT is issued WITHOUT a Slug header.
+  test('no write ever targets …/TomTwinProjects/TomTwinProjects/… and ensureContainer has no Slug (doubling regression)', async () => {
     const id = 'my-project-a1b2'
     mockHyperFetch.mockImplementation(async () => notFound())
+
+    // Mock the session fetch that _ensureContainer uses.
+    // HEAD → 404 (container does not exist), PUT → 201 (created).
+    const mockSessionFetch = vi.fn().mockImplementation(async (url, opts) => {
+      if (opts?.method === 'HEAD') return { ok: false, status: 404 }
+      if (opts?.method === 'PUT') return { ok: true, status: 201 }
+      return { ok: false, status: 404 }
+    })
+
     const { useSessionIndex } = await importHook()
     const docRef = ref('some content')
     const hook = useSessionIndex({ document: docRef })
     hook.setPodRoot(POD_ROOT)
+    hook.setSessionFetch(mockSessionFetch)
 
     // Full new-project create flow: createNewSession → saveCurrentSession.
     hook.activeSessionId.value = id
@@ -304,16 +318,18 @@ describe('useSessionIndex — Cycle 066 TomTwinProjects + dual-read', () => {
     await hook.saveIndex()
     await hook.saveCurrentSession('My Project')
 
+    // 1. No uploadFile call (JSON writes) targets the doubled TomTwinProjects segment.
     const allUrls = mockUploadFile.mock.calls.map(([u]) => u)
-    // No URL may contain the doubled TomTwinProjects segment.
     const doubled = allUrls.filter(u => u.includes('TomTwinProjects/TomTwinProjects'))
     expect(doubled).toHaveLength(0)
-    // No BasicContainer PUT should be issued (write-order idiom only).
-    // Confirmed by the absence of any turtle body in uploadFile calls —
-    // all calls are JSON or binary, never text/turtle BasicContainer.
-    const turtleCalls = mockUploadFile.mock.calls.filter(([, , ct]) =>
-      typeof ct === 'string' && ct.includes('turtle')
-    )
-    expect(turtleCalls).toHaveLength(0)
+
+    // 2. The ensureContainer PUT calls (via session fetch) must NOT include a Slug header.
+    // Slug on PUT creates a child INSIDE the container, not AT the URL — the doubling bug.
+    const putCalls = mockSessionFetch.mock.calls.filter(([, opts]) => opts?.method === 'PUT')
+    expect(putCalls.length).toBeGreaterThan(0) // at least one container PUT was issued
+    for (const [, opts] of putCalls) {
+      expect(opts?.headers?.Slug).toBeUndefined() // NO Slug header on any PUT
+      expect(opts?.headers?.['Slug']).toBeUndefined()
+    }
   })
 })

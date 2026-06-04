@@ -63,14 +63,13 @@
  * reads and writes it (via the ref passed in) but does NOT own it. The single
  * source of truth for workspace content is the document ref in useWorkspace.js.
  *
- * Subdirectory support: CONFIRMED via Cycle 12 (LDP BasicContainer PUT to
- * {podRoot}/home/TomTwin/ succeeded). The /home/TomTwinProjects/ container and
- * each <id>/ project folder are auto-materialized by write-order discipline: each
- * write targets a path exactly ONE level below an already-existing container.
- *   Step 1: PUT index.json → TomTwinProjects/ auto-materializes (one level into /home/).
- *   Step 2: PUT <id>/manifest.json → <id>/ auto-materializes (one level into TomTwinProjects/).
- *   Step 3: PUT <id>/content.json → <id>/ already exists.
- * No text/turtle BasicContainer PUT required. Confirmed working on tst-planlegger.twinpod.eu.
+ * Container pre-creation: strict-LDP pods (tst-planlegger.twinpod.eu, tst-solveig)
+ * return 409 when a PUT targets a path whose immediate parent container does not exist.
+ * _ensureContainer (HEAD-first, text/turtle PUT, NO Slug) creates TomTwinProjects/ and
+ * each <id>/ folder before the first file write. Guards (_rootContainerEnsured,
+ * _projectContainersEnsured) prevent redundant round-trips per session. Lenient pods
+ * (demo.systemtwin.com) auto-materialise containers on write; the guards make the
+ * extra HEAD effectively free after the first check.
  *
  * @param {{ document: import('vue').Ref<string> }} workbookRefs
  *   An object containing the shared document ref from useWorkspace. Passed in
@@ -180,30 +179,40 @@ const MANIFEST_SCHEMA_VERSION = 1
 // is never read to make an access decision. A receiving pod may later populate it.
 const MANIFEST_OWNER_PLACEHOLDER = null
 
-// WRITE-ORDER DISCIPLINE (Cycle 066-extended rev3, 2026-06-04)
-// ---------------------------------------------------------------
-// tst-planlegger.twinpod.eu (strict LDP) returns 409 Conflict when a file PUT
-// targets a path whose immediate parent container does not yet exist.
+// CONTAINER PRE-CREATION FOR STRICT LDP PODS (Cycle 066-extended rev4, 2026-06-04)
+// ---------------------------------------------------------------------------------
+// tst-planlegger.twinpod.eu and tst-solveig.twinpod.eu are strict LDP pods: they
+// return 409 Conflict when a PUT targets a path whose IMMEDIATE parent container
+// does not yet exist — even if the grandparent exists. Auto-materialization (writing
+// one level into an existing container) only works on lenient pods such as
+// demo.systemtwin.com.
 //
-// The fix is write-order discipline — each write targets a path exactly ONE LEVEL
-// below an already-existing container. One-level PUTs auto-materialize the parent:
+// The fix is _ensureContainer — a best-effort HEAD-first guard that creates the
+// container with a text/turtle PUT if it is missing. No Slug header is added:
 //
-//   Step 1: PUT {root}/index.json          → TomTwinProjects/ auto-materializes
-//           (TomTwinProjects/ is one level into /home/, which always exists).
-//   Step 2: PUT {root}/<id>/manifest.json  → <id>/ auto-materializes
-//           (one level into TomTwinProjects/, which now exists after Step 1).
-//   Step 3: PUT {root}/<id>/content.json   → <id>/ already exists.
+//   ⚠  PUT to containerUrl/ WITH Slug: X creates a CHILD container INSIDE
+//      containerUrl/ named X — NOT the container AT containerUrl/. Adding Slug
+//      when PUTting TO a URL was the root cause of the prior doubling bug that
+//      created /home/TomTwinProjects/TomTwinProjects/ (commit dce9ccf).
 //
-// This replaces the prior _ensureContainer approach (dce9ccf) which used
-// text/turtle PUT + BasicContainer Link header — broken on tst-planlegger
-// post-2026-05-30 (Fred removed the turtle-into-pod hack).
+// Correct invocation — NO Slug, PUT goes TO the target URL:
+//   PUT {root}/TomTwinProjects/  → creates the container AT that URL.
+//   PUT {root}/TomTwinProjects/<id>/  → creates the project container AT that URL.
 //
-// Invariants:
-//   - saveIndex() (which writes index.json) must complete before any <id>/ write.
-//     createNewSession() awaits saveIndex() before returning; the autosave debounce
-//     (180 s) cannot fire before that. No additional guard needed.
-//   - saveCurrentSession() writes manifest.json BEFORE content.json. manifest.json
-//     auto-materializes <id>/; content.json then lands cleanly.
+// The POST-2026-05-30 note about "Fred removed the turtle-into-pod hack" referred
+// to server-side automatic label injection from the Turtle body — NOT to the PUT
+// container creation itself. The container IS created by the PUT; the rdfs:label
+// body line is silently dropped post-2026-05-30, so the body is sent empty.
+//
+// Write-order still applies as belt-and-suspenders (lenient pods get the auto-
+// materialisation path; strict pods get the pre-created container):
+//   Step 1: _ensureContainer(TomTwinProjects/) → exists or created.
+//   Step 2: saveIndex() writes index.json → no-op on the container.
+//   Step 3: _ensureContainer(<id>/) → exists or created.
+//   Step 4: saveCurrentSession writes manifest.json BEFORE content.json.
+//
+// The label (comma) in the SystemTwin tree for pre-existing containers is a
+// Fred-side fix — it is NOT blocking this change.
 
 // Module-level state so App.vue and all injected children share the same reactive refs.
 const sessionList = ref([])
@@ -289,6 +298,77 @@ let _lastSavedContent = ''
 // only marks "created-this-session, never written to pod".
 const _freshSessions = new Set()
 
+// MODULE-LEVEL: authenticated session fetch, captured via setSessionFetch().
+// Required for HEAD and PUT calls in _ensureContainer. Null until App.vue
+// calls setSessionFetch(session.fetch.bind(session)) after auth resolves.
+// _ensureContainer early-returns (no-op) when this is null, so tests that
+// do not wire a fetch still pass.
+let _sessionFetch = null
+
+// MODULE-LEVEL: guard flags to prevent redundant HEAD + PUT round-trips.
+//
+// _rootContainerEnsured — true once TomTwinProjects/ has been confirmed or
+// created this session. The root container does not disappear mid-session.
+// Reset by _resetModuleStateForTesting().
+let _rootContainerEnsured = false
+
+// _projectContainersEnsured — Set of project IDs whose <id>/ container has
+// been confirmed or created. Projects do not disappear mid-session.
+// Reset by _resetModuleStateForTesting().
+const _projectContainersEnsured = new Set()
+
+/**
+ * Best-effort HEAD-first container pre-creation for strict LDP pods.
+ *
+ * TwinPod™ pods on tst-planlegger.twinpod.eu and tst-solveig.twinpod.eu return
+ * 409 Conflict when a PUT targets a path whose immediate parent container does not
+ * yet exist — even if the grandparent exists. This guard creates the container before
+ * any file write so strict-pod saves succeed.
+ *
+ * CRITICAL — NO Slug header: PUT to containerUrl/ without a Slug creates the container
+ * AT that URL (standard LDP PUT semantics). Adding a Slug header would create a CHILD
+ * container INSIDE the URL, not at it — that is what caused the doubling bug in dce9ccf.
+ * // NO Slug header — Slug on PUT creates a child INSIDE the container, not AT the URL.
+ *
+ * Body is intentionally empty: the rdfs:label line is silently dropped by TwinPod™
+ * post-2026-05-30. The container IS created; label is a Fred-side concern.
+ *
+ * @param {string} containerUrl - URL of the container to ensure (must end with /).
+ * @param {Function} authenticatedFetch - DPoP-authenticated session.fetch.
+ * @returns {Promise<void>}
+ */
+/**
+ * @returns {Promise<boolean>} true when the container exists or was successfully
+ *   created; false when the container could not be confirmed or created (guard
+ *   must NOT be set in that case — the next save should retry).
+ */
+async function _ensureContainer(containerUrl, authenticatedFetch) {
+  if (!authenticatedFetch) return true // no fetch wired — treat as "ok to proceed"
+  try {
+    const head = await authenticatedFetch(containerUrl, { method: 'HEAD' })
+    if (head.ok) return true   // already exists — no PUT needed
+    if (head.status !== 404) return false // unexpected status — don't attempt create
+    const put = await authenticatedFetch(containerUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'text/turtle',
+        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+        // NO Slug header — Slug on PUT creates a child INSIDE the container, not AT the URL.
+      },
+      body: '' // empty — rdfs:label body is silently dropped post-2026-05-30
+    })
+    // Return true only if PUT succeeded (2xx). A failed PUT means the container may
+    // not exist; caller must not cache the guard as "done" — retry on next save.
+    return put.ok
+  } catch (e) {
+    // Best-effort: log and continue. On a lenient pod the file PUT auto-materialises
+    // the container anyway; on a strict pod the subsequent file PUT may 409 (surfaced
+    // by saveIndex / saveCurrentSession error handling).
+    console.warn('[useSessionIndex] _ensureContainer failed (best-effort):', containerUrl, e)
+    return false
+  }
+}
+
 // localStorage backup key prefix (Guard C — belt-and-suspenders safety net).
 // Every saveCurrentSession call mirrors the workbook content here under
 // the active session id. On app boot, App.vue checks for a more-recent
@@ -335,6 +415,9 @@ export function _resetModuleStateForTesting() {
   _lastSavedContent = ''
   _sessionMeta.clear()
   _freshSessions.clear()
+  _sessionFetch = null
+  _rootContainerEnsured = false
+  _projectContainersEnsured.clear()
 }
 
 // Helper key for localStorage backups (Guard C).
@@ -913,9 +996,18 @@ export function useSessionIndex({ document }) {
     // programmatic clear as a user edit (Cycle 045 iter-2 change-aware autosave).
     _lastSavedContent = ''
 
-    // Write-order discipline: saveIndex() writes index.json ONE LEVEL into /home/,
-    // which auto-materializes TomTwinProjects/ on strict-LDP pods (tst-planlegger).
-    // No explicit container pre-creation needed — the grandparent /home/ always exists.
+    // Ensure TomTwinProjects/ container exists before writing index.json.
+    // Required on strict-LDP pods (tst-planlegger, tst-solveig) where a PUT to a
+    // path whose immediate parent does not exist returns 409. The guard is a no-op
+    // once confirmed this session (_rootContainerEnsured). On lenient pods (demo)
+    // the ensureContainer HEAD may get a 404 and the subsequent PUT auto-materialises
+    // the container (same end result). Best-effort: failure does not block saveIndex().
+    if (!_rootContainerEnsured) {
+      const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch)
+      // Only cache the guard on success. A failed PUT means the container may not
+      // exist; the next save will retry rather than silently skip the check.
+      if (ok) _rootContainerEnsured = true
+    }
     await saveIndex()
   }
 
@@ -1052,14 +1144,30 @@ export function useSessionIndex({ document }) {
     // ──────────────────────────────────────────────────────────────────────────
 
     try {
-      // Write-order discipline (Cycle 066-extended rev3, 2026-06-04):
-      // manifest.json FIRST, content.json SECOND.
+      // --- Ensure containers exist before writing ---
       //
-      // On tst-planlegger.twinpod.eu (strict LDP), writing a file one level into an
-      // existing container auto-materializes that container. TomTwinProjects/ exists
-      // after saveIndex() (Step 1 of createNewSession). Writing manifest.json into
-      // TomTwinProjects/<id>/ is one level deep → auto-materializes <id>/. The
-      // subsequent content.json PUT lands in an already-existing <id>/ → no 409.
+      // On strict-LDP pods (tst-planlegger, tst-solveig) a PUT to a path whose
+      // immediate parent container does not yet exist returns 409. We ensure both
+      // TomTwinProjects/ (the root) and TomTwinProjects/<id>/ (the project folder)
+      // exist before writing any files.
+      //
+      // Guard semantics: _rootContainerEnsured prevents re-checking TomTwinProjects/
+      // more than once per session. _projectContainersEnsured prevents re-checking
+      // the same project folder more than once. Both are best-effort — a failed
+      // _ensureContainer is logged and does not throw; the subsequent file PUT may
+      // still succeed on lenient pods where auto-materialisation covers the gap.
+      if (!_rootContainerEnsured) {
+        const ok = await _ensureContainer(sessionsRoot() + '/', _sessionFetch)
+        if (ok) _rootContainerEnsured = true
+      }
+      if (!_projectContainersEnsured.has(id)) {
+        const ok = await _ensureContainer(folderUrl(id), _sessionFetch)
+        if (ok) _projectContainersEnsured.add(id)
+      }
+
+      // Write manifest.json BEFORE content.json (belt-and-suspenders write order).
+      // On lenient pods without _ensureContainer the manifest PUT auto-materialises
+      // <id>/; on strict pods the _ensureContainer above already created it.
       //
       // Failure semantics: manifest failure is non-fatal (surfaced, isDirty NOT
       // restored — the content write has not happened yet, so retrying saves both).
@@ -1842,6 +1950,21 @@ export function useSessionIndex({ document }) {
     _podRoot = podRoot ? podRoot.replace(/\/+$/, '') : ''
   }
 
+  /**
+   * Records the DPoP-authenticated session fetch function.
+   * Must be called by App.vue right after setPodRoot — before any container
+   * pre-creation can run. Parallel to the useCreditLedger / loadCredits pattern
+   * where session.fetch is passed as a parameter rather than accessed via
+   * window.solid.session (which would violate the single-namespace rule).
+   *
+   * Spec: required by _ensureContainer to issue HEAD + PUT requests to the pod.
+   *
+   * @param {Function} sessionFetchFn - session.fetch.bind(session) from App.vue.
+   */
+  function setSessionFetch(sessionFetchFn) {
+    _sessionFetch = typeof sessionFetchFn === 'function' ? sessionFetchFn : null
+  }
+
   return {
     sessionList,
     activeSessionId,
@@ -1854,6 +1977,7 @@ export function useSessionIndex({ document }) {
     isSavingProject,
     isDirty,
     setPodRoot,
+    setSessionFetch,
     loadIndex,
     saveIndex,
     rebuildIndexFromManifests,
