@@ -64,11 +64,14 @@ export default {
     // checkoutLoading is a dedicated ref that's only true during an active startCheckout call.
     // It is NOT loading (which tracks loadCredits/applyPendingCredits). Using loading here
     // caused buttons to be disabled while loadCredits was in-flight at page load.
-    const { checkoutLoading, error, startCheckout: composableStartCheckout } = useCreditLedger()
+    const { checkoutLoading, error: composableError, startCheckout: composableStartCheckout } = useCreditLedger()
 
     // App.vue provides startCheckout from its own (correctly initialised) useCreditLedger
     // instance. Injecting it here bypasses any dual-instance _podRoot problem.
     const injectedStartCheckout = inject('startCheckout', null)
+    // Prefer App-provided error so dual-instance module copies still surface
+    // the message written by the checkout that actually ran.
+    const injectedError = inject('creditError', null)
 
     // Bundle price IDs provided by App.vue — maps bundle key to Stripe priceId string.
     // If not provided (e.g. in tests), buttons show but clicking logs a warning.
@@ -94,7 +97,7 @@ export default {
     return {
       BUNDLES,
       checkoutLoading,
-      error,
+      error: injectedError || composableError,
       onBuyClick
     }
   }

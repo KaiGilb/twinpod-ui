@@ -494,9 +494,27 @@ export function useCreditLedger() {
    *
    * Spec: 3P.F.ContributionFlow — opens Stripe Checkout for a credit bundle purchase
    */
-  async function startCheckout(priceId) {
-    if (!priceId || !_podRoot) {
-      console.error('[useCreditLedger] startCheckout requires priceId and podRoot to be set', { priceId: !!priceId, _podRoot: !!_podRoot })
+  /**
+   * @param {string} priceId
+   * @param {{ podRoot?: string, bearerToken?: string }} [opts]
+   *   Optional override when the module-scope `_podRoot` was never set
+   *   (loadCredits not run on this instance, dual-module copy, etc.).
+   *   App.vue should pass live podRoot/token so checkout never depends
+   *   solely on module state (Kai 2026-08-11).
+   */
+  async function startCheckout(priceId, opts = {}) {
+    const podRoot = (opts && typeof opts.podRoot === 'string' && opts.podRoot)
+      ? opts.podRoot
+      : _podRoot
+    const bearerToken = (opts && typeof opts.bearerToken === 'string')
+      ? opts.bearerToken
+      : _bearerToken
+    // Capture for subsequent calls so inject/fallback paths recover.
+    if (podRoot && !_podRoot) _podRoot = podRoot
+    if (bearerToken && !_bearerToken) _bearerToken = bearerToken
+
+    if (!priceId || !podRoot) {
+      console.error('[useCreditLedger] startCheckout requires priceId and podRoot to be set', { priceId: !!priceId, podRoot: !!podRoot, _podRoot: !!_podRoot })
       // Show a visible error so the user sees feedback rather than silent failure.
       // Most common cause: this useCreditLedger instance was never initialised via
       // loadCredits (dual-instance / module dedup issue). See provide('startCheckout')
@@ -514,11 +532,11 @@ export function useCreditLedger() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           priceId,
-          podRoot: _podRoot,
+          podRoot,
           returnUrl: window.location.href,
           // Pass the bearer token so the checkout endpoint can store it in KV
           // for the webhook handler to use when writing the credit ledger.
-          bearerToken: _bearerToken
+          bearerToken: bearerToken || null
         })
       })
 
