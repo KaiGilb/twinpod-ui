@@ -1191,7 +1191,17 @@ export function useSessionIndex({ document }) {
    * @returns {Promise<void>}
    */
   async function saveCurrentSession(name) {
-    if (!_podRoot || !activeSessionId.value) return
+    if (!_podRoot || !activeSessionId.value) return false
+    // 2026-09-07: after a 403/401 the pod will not accept writes until re-login.
+    // Bail before HEAD/PUT so we do not keep hitting trinity.
+    if (typeof ur.podWritesBlocked === 'function' && ur.podWritesBlocked()) {
+      const status = typeof ur.podWriteCircuitStatus === 'function'
+        ? ur.podWriteCircuitStatus()
+        : 403
+      sessionSaveError.value = `Could not save session file (HTTP ${status}). Re-login to continue.`
+      isDirty.value = true
+      return false
+    }
 
     sessionSaving.value = true
     sessionSaveError.value = null
@@ -1366,10 +1376,13 @@ export function useSessionIndex({ document }) {
         const status = contentSettled.status === 'fulfilled'
           ? (contentSettled.value?.status || 0)
           : 0
+        if (typeof ur.tripPodWriteCircuit === 'function') {
+          ur.tripPodWriteCircuit(status, sessionFileUrl)
+        }
         sessionSaveError.value = contentSettled.status === 'rejected'
           ? 'Could not save session (network error).'
           : `Could not save session file (HTTP ${status}).`
-        return
+        return false
       }
 
       // Manifest-write outcome is NON-FATAL: surfaced but isDirty is NOT restored
@@ -1417,10 +1430,12 @@ export function useSessionIndex({ document }) {
       // device). The backup is only valuable while it represents unsaved-
       // to-pod work.
       _clearLocalStorageBackup(id)
+      return true
     } catch (err) {
       // Network failure — restore isDirty.
       isDirty.value = true
       sessionSaveError.value = 'Could not save session (network error).'
+      return false
     } finally {
       sessionSaving.value = false
     }
@@ -1639,7 +1654,11 @@ export function useSessionIndex({ document }) {
             ur.enqueueSave({
               resourceKey: sessionFileUrl,
               label: 'workbook-save-after-restore',
-              task: () => saveCurrentSession(sessionName)
+              task: async () => {
+                const ok = await saveCurrentSession(sessionName)
+                if (!ok) throw new Error(sessionSaveError.value || 'workbook save failed')
+                return { ok: true }
+              }
             })
           }
         }
@@ -1868,6 +1887,7 @@ export function useSessionIndex({ document }) {
       _autosaveTimer = setTimeout(() => {
         _autosaveTimer = null
         if (!isDirty.value || !activeSessionId.value) return
+        if (typeof ur.podWritesBlocked === 'function' && ur.podWritesBlocked()) return
         const name = sessionList.value.find(s => s.id === activeSessionId.value)?.name
           ?? 'Session'
         enqueueWorkbookSave(name)
@@ -1954,6 +1974,9 @@ export function useSessionIndex({ document }) {
    */
   function enqueueWorkbookSave(name) {
     if (!_podRoot || !activeSessionId.value) return null
+    // Circuit open → do not enqueue (avoids a stream of fail-fast "Save failed"
+    // toasts). The first 401/403 already surfaced sessionSaveError.
+    if (typeof ur.podWritesBlocked === 'function' && ur.podWritesBlocked()) return null
     const id = activeSessionId.value
     const sessionName = name
       ?? sessionList.value.find(s => s.id === id)?.name
@@ -1969,7 +1992,11 @@ export function useSessionIndex({ document }) {
     return ur.enqueueSave({
       resourceKey: sessionFileUrl,
       label: 'workbook-save',
-      task: () => saveCurrentSession(sessionName)
+      task: async () => {
+        const ok = await saveCurrentSession(sessionName)
+        if (!ok) throw new Error(sessionSaveError.value || 'workbook save failed')
+        return { ok: true }
+      }
     })
   }
 

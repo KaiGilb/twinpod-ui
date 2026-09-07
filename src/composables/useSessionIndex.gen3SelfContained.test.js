@@ -66,7 +66,12 @@ vi.mock('@kaigilb/twinpod-client', () => ({
     onSaveEvent: vi.fn((fn) => {
       _saveListeners.add(fn)
       return () => _saveListeners.delete(fn)
-    })
+    }),
+    isTerminalPodWriteStatus: (s) => s === 401 || s === 403,
+    tripPodWriteCircuit: vi.fn(() => false),
+    podWritesBlocked: vi.fn(() => false),
+    podWriteCircuitStatus: vi.fn(() => null),
+    resetPodWriteCircuit: vi.fn()
   }
 }))
 
@@ -1070,5 +1075,35 @@ describe('useSessionIndex — Cycle 066-extended DEEP self-contained project fol
     // isDirty must NOT be restored (a Promise.all+catch regression would set it).
     expect(hookM.isDirty.value).toBe(false)
     expect(hookM.sessionSaveError.value).toMatch(/manifest/i)
+  })
+
+  test('content PUT 403 trips the write circuit and enqueueWorkbookSave then no-ops', async () => {
+    const { ur } = await import('@kaigilb/twinpod-client')
+    ur.podWritesBlocked.mockReturnValue(false)
+    ur.tripPodWriteCircuit.mockClear()
+
+    const { useSessionIndex } = await importHook()
+    const docRef = ref('body')
+    const id = 'fail-403-eeee'
+    mockHyperFetch.mockImplementation(async () => notFound())
+    mockUploadFile.mockImplementation(async (url) => {
+      if (url === `${ROOT}/${id}/content.json`) return { ok: false, status: 403 }
+      return { ok: true, status: 200 }
+    })
+    const hook = useSessionIndex({ document: docRef })
+    hook.setPodRoot(POD_ROOT)
+    hook.sessionList.value = [{ id, name: 'E', project: 'The Brain', lastModified: new Date().toISOString() }]
+    hook.activeSessionId.value = id
+
+    const ok = await hook.saveCurrentSession('E')
+    expect(ok).toBe(false)
+    expect(hook.sessionSaveError.value).toContain('403')
+    expect(ur.tripPodWriteCircuit).toHaveBeenCalledWith(403, expect.stringContaining('content.json'))
+
+    ur.podWritesBlocked.mockReturnValue(true)
+    mockEnqueueSave.mockClear()
+    expect(hook.enqueueWorkbookSave('E')).toBe(null)
+    expect(mockEnqueueSave).not.toHaveBeenCalled()
+    ur.podWritesBlocked.mockReturnValue(false)
   })
 })

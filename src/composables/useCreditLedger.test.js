@@ -42,7 +42,12 @@ vi.mock('@kaigilb/twinpod-client', () => ({
     onSaveEvent: vi.fn((fn) => {
       _saveListeners.add(fn)
       return () => _saveListeners.delete(fn)
-    })
+    }),
+    isTerminalPodWriteStatus: (s) => s === 401 || s === 403,
+    tripPodWriteCircuit: vi.fn(() => true),
+    podWritesBlocked: vi.fn(() => false),
+    podWriteCircuitStatus: vi.fn(() => null),
+    resetPodWriteCircuit: vi.fn()
   }
 }))
 
@@ -436,3 +441,50 @@ describe('useCreditLedger — Group 5 queue routing (BareFileSave 2026-05-23)', 
   })
 
 })
+
+describe('useCreditLedger — decrementCredit 403 circuit (2026-09-07)', () => {
+  test('GET 403 does not PUT and trips the write circuit', async () => {
+    const { ur } = await import('@kaigilb/twinpod-client')
+    ur.podWritesBlocked.mockReturnValue(false)
+    ur.tripPodWriteCircuit.mockClear()
+    mockEnqueueSave.mockClear()
+
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+    const { loadCredits, decrementCredit, balance } = useCreditLedger()
+
+    const existing = {
+      balance: 150,
+      ledger: [{ type: 'grant', credits: 150, reason: 'free-trial', ts: '2026-09-07T00:00:00Z' }],
+      processedEvents: [],
+      updatedAt: '2026-09-07T00:00:00Z',
+      trialUsed: true,
+      trialStartedAt: null
+    }
+    const auth = makeAuthFetch(
+      realLedgerResponse(existing),
+      { ok: false, status: 403, json: async () => ({}) }
+    )
+    await loadCredits('https://crowboxpartners.twinpod.us', 'tok', auth, 'https://crowboxpartners.twinpod.us/i')
+    expect(balance.value).toBe(150)
+
+    mockEnqueueSave.mockClear()
+    await decrementCredit(2, auth)
+
+    expect(ur.tripPodWriteCircuit).toHaveBeenCalledWith(403, expect.stringContaining('thebrain-credits.json'))
+    expect(mockEnqueueSave).not.toHaveBeenCalled()
+  })
+
+  test('open circuit skips decrementCredit with no GET', async () => {
+    const { ur } = await import('@kaigilb/twinpod-client')
+    ur.podWritesBlocked.mockReturnValue(true)
+
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+    const { decrementCredit } = useCreditLedger()
+    const auth = vi.fn()
+    await decrementCredit(2, auth)
+    expect(auth).not.toHaveBeenCalled()
+
+    ur.podWritesBlocked.mockReturnValue(false)
+  })
+})
+
