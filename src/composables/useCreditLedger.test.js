@@ -486,5 +486,33 @@ describe('useCreditLedger — decrementCredit 403 circuit (2026-09-07)', () => {
 
     ur.podWritesBlocked.mockReturnValue(false)
   })
+
+  test('overlapping decrementCredit calls issue one PUT (in-flight lock)', async () => {
+    const { useCreditLedger } = await import('./useCreditLedger.js')
+    const existing = {
+      balance: 150,
+      ledger: [{ type: 'grant', credits: 150, reason: 'free-trial', ts: '2026-09-07T00:00:00Z' }],
+      processedEvents: [],
+      updatedAt: '2026-09-07T00:00:00Z',
+      trialUsed: true,
+      trialStartedAt: null
+    }
+    const auth = makeAuthFetch(
+      realLedgerResponse(existing),
+      realLedgerResponse(existing),
+      realLedgerResponse(existing)
+    )
+    mockUploadJSON.mockResolvedValue({ ok: true, status: 201 })
+    const { loadCredits, decrementCredit } = useCreditLedger()
+    await loadCredits('https://crowboxpartners.twinpod.us', 'tok', auth, 'https://crowboxpartners.twinpod.us/i')
+    mockEnqueueSave.mockClear()
+
+    await Promise.all([
+      decrementCredit(2, auth),
+      decrementCredit(2, auth),
+      decrementCredit(2, auth)
+    ])
+    expect(mockEnqueueSave).toHaveBeenCalledTimes(1)
+  })
 })
 

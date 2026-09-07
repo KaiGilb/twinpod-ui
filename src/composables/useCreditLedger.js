@@ -74,6 +74,18 @@ import { isRealTwinPodResource } from './util/twinpod-resource-exists.js'
 // that Cycle-15 introduced because of hyperFetch's RDF Accept headers.
 const CREDIT_LEDGER_BACKUP_KEY = 'theBrain.creditLedgerBackup'
 
+// 2026-09-07: decrementCredit was GET+PUT the same ledger on every extra
+// isStreaming→false (updatedAt was the only change). TwinPod versions each
+// PUT (Solr + S3). In-flight lock + fingerprint skip stop that success loop.
+let _decrementInFlight = false
+let _lastDecrementFingerprint = null
+
+function _ledgerFingerprint(ledger) {
+  if (!ledger || typeof ledger !== 'object') return ''
+  const { updatedAt, ...rest } = ledger
+  return JSON.stringify(rest)
+}
+
 function _writeLedgerBackup(snapshot) {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
@@ -881,11 +893,13 @@ export function useCreditLedger() {
   async function decrementCredit(amount, authenticatedFetch) {
     if (!amount || amount <= 0 || !_podRoot || !authenticatedFetch) return
     if (balance.value <= 0) return  // already exhausted — no-op
+    if (_decrementInFlight) return
     // 2026-09-07: a 403 GET/PUT loop on thebrain-credits.json hammered
     // crowboxpartners.twinpod.us after trinity restarted. Once the circuit is
     // open, do not issue another GET+PUT — it will not recover without login.
     if (typeof ur.podWritesBlocked === 'function' && ur.podWritesBlocked()) return
 
+    _decrementInFlight = true
     // Optimistic update — UI reflects immediately (before pod write)
     balance.value = Math.max(0, balance.value - amount)
 
@@ -948,6 +962,12 @@ export function useCreditLedger() {
         updatedAt: new Date().toISOString()
       }
 
+      const fp = _ledgerFingerprint(updated)
+      if (fp && fp === _lastDecrementFingerprint) {
+        console.warn('[useCreditLedger] decrementCredit skip identical PUT')
+        return
+      }
+
       // Route through the queue (BareFileSave Group 5 — shared resourceKey).
       await _enqueueLedgerWrite({
         resourceKey: ledgerUrl,
@@ -959,6 +979,7 @@ export function useCreditLedger() {
             console.warn('[useCreditLedger] decrementCredit PUT failed (non-fatal):', putRes?.status)
             throw new Error(`decrementCredit PUT failed (${putRes?.status || 0})`)
           }
+          _lastDecrementFingerprint = fp
           return { ok: true }
         }
       }).catch((err) => {
@@ -968,6 +989,8 @@ export function useCreditLedger() {
     } catch (err) {
       // Non-fatal — optimistic decrement already applied; pod write is best-effort
       console.warn('[useCreditLedger] decrementCredit error (non-fatal):', err?.message || err)
+    } finally {
+      _decrementInFlight = false
     }
   }
 
