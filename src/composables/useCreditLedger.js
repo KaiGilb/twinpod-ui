@@ -881,6 +881,10 @@ export function useCreditLedger() {
   async function decrementCredit(amount, authenticatedFetch) {
     if (!amount || amount <= 0 || !_podRoot || !authenticatedFetch) return
     if (balance.value <= 0) return  // already exhausted — no-op
+    // 2026-09-07: a 403 GET/PUT loop on thebrain-credits.json hammered
+    // crowboxpartners.twinpod.us after trinity restarted. Once the circuit is
+    // open, do not issue another GET+PUT — it will not recover without login.
+    if (typeof ur.podWritesBlocked === 'function' && ur.podWritesBlocked()) return
 
     // Optimistic update — UI reflects immediately (before pod write)
     balance.value = Math.max(0, balance.value - amount)
@@ -901,7 +905,16 @@ export function useCreditLedger() {
           method: 'GET',
           headers: { 'Accept': 'application/json' }
         })
-        if (getRes.ok) {
+        if (getRes && typeof ur.tripPodWriteCircuit === 'function') {
+          ur.tripPodWriteCircuit(getRes.status, ledgerUrl)
+        }
+        if (getRes && typeof ur.isTerminalPodWriteStatus === 'function'
+            && ur.isTerminalPodWriteStatus(getRes.status)) {
+          // GET 401/403 — PUT would 403 too. Do not write.
+          console.warn('[useCreditLedger] decrementCredit GET terminal', getRes.status)
+          return
+        }
+        if (getRes?.ok) {
           // Cycle 19 follow-up #3: TwinPod 200-not-404 quirk — only spread
           // the GET body when it is a real ledger. Fabricated metadata has
           // no `balance` field; the spread would silently leave in-memory
